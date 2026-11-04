@@ -61,3 +61,4 @@ g++ -std=c++20 -O2 -Wall -Wextra main.cpp -o SubHz.exe \
 
 ### Running outside MSYS2:
 Ensure `libraylib.dll` and `glfw3.dll` (from `C:\msys64\ucrt64\bin`) reside in the same folder as `SubHz.exe`, or have `C:\msys64\ucrt64\bin` added to your system `PATH`.
+
