@@ -1,5 +1,5 @@
 // =====================================================================================
-//  SubHz - Phase 2: Real-Time Bass Audio Capture & FFT Spectrum Visualizer
+//  SubHz - Phase 3: Real-Time Chromatic Bass Tuner & FFT Spectrum Visualizer
 //  Real-time bass guitar visualizer / tuner (C++20, raylib, miniaudio)
 //
 //  - 1280x720 window @ 180 FPS, background #121212
@@ -569,7 +569,7 @@ int main() {
         if (clipping) DrawText("CLIP", cfg::kWidth - 84, 16, 24, RED);
 
         // Top-center Tuner UI Overlay
-        // Tuner overlay wired in next step
+        DrawTunerOverlay(tuner, smoothedCents, smoothedHz);
 
         // Compact oscilloscope panel
         DrawRectangleLines(static_cast<int>(kMarginX), static_cast<int>(kWaveTop),
