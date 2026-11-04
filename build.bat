@@ -6,8 +6,9 @@ echo Building SubHz...
 set "UCRT_BIN=C:\msys64\ucrt64\bin"
 set "PATH=%UCRT_BIN%;%PATH%"
 
-g++ -std=c++20 -O2 -Wall -Wextra main.cpp -o SubHz.exe ^
-  -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic ^
+g++ -std=c++17 -O3 -Wall -Wextra main.cpp -o SubHz.exe ^
+  -static-libgcc -static-libstdc++ ^
+  -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic ^
   -lraylib -lopengl32 -lgdi32 -lwinmm
 
 if %ERRORLEVEL% equ 0 (
