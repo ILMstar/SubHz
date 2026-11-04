@@ -1,0 +1,18 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.a
+*.pdb
+*.ilk
+*.log
+
+# Shared libraries / DLLs
+*.dll
+
+# Editor & OS files
+.vscode/
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
