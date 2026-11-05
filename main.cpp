@@ -209,43 +209,47 @@ static TunerReading DetectBassPitch(const std::vector<float>& magnitudes,
     TunerReading out{};
     if (magnitudes.size() <= 2 || binWidthHz <= 0.0f) return out;
 
-    // Scan strictly between 30 Hz and 400 Hz (keep 1-bin margin for peak +/- 1).
+    // Scan bins covering [30 Hz, 400 Hz] (keeping 1-bin margin for peak +/- 1) and
+    // require a true local maximum so skirts of out-of-band (<30 Hz or >400 Hz) tones
+    // never falsely trigger the tuner at the band edges.
     const size_t minBin = std::max<size_t>(
-        1, static_cast<size_t>(std::ceil(cfg::kTunerMinHz / binWidthHz)));
+        1, static_cast<size_t>(std::floor(cfg::kTunerMinHz / binWidthHz)));
     const size_t maxBin = std::min<size_t>(
         magnitudes.size() - 2,
-        static_cast<size_t>(std::floor(cfg::kTunerMaxHz / binWidthHz)));
+        static_cast<size_t>(std::ceil(cfg::kTunerMaxHz / binWidthHz)));
     if (minBin > maxBin) return out;
 
-    size_t peakBin = minBin;
-    float  peakMag = magnitudes[minBin];
-    for (size_t k = minBin + 1; k <= maxBin; ++k) {
-        if (magnitudes[k] > peakMag) {
-            peakMag = magnitudes[k];
-            peakBin = k;
+    // Find the strongest true local spectral peak whose interpolated frequency lies
+    // strictly inside [30 Hz, 400 Hz]. Raising Hann magnitudes to p = 0.23 makes the
+    // main lobe closely parabolic (< 1.3 ct bias across 30 - 400 Hz).
+    constexpr double kHannPower = 0.23;
+    float  bestMag  = 0.0f;
+    double bestFreq = 0.0;
+
+    for (size_t k = minBin; k <= maxBin; ++k) {
+        const float m = magnitudes[k];
+        if (m < cfg::kTunerGateMag || m <= bestMag) continue;
+        if (m < magnitudes[k - 1] || m < magnitudes[k + 1]) continue;
+
+        const double y1 = std::pow(std::max(static_cast<double>(magnitudes[k - 1]), 1e-12), kHannPower);
+        const double y2 = std::pow(std::max(static_cast<double>(m),                 1e-12), kHannPower);
+        const double y3 = std::pow(std::max(static_cast<double>(magnitudes[k + 1]), 1e-12), kHannPower);
+
+        const double denom = y1 - 2.0 * y2 + y3;
+        double delta = 0.0;
+        if (std::fabs(denom) > 1e-12) {
+            delta = std::clamp(0.5 * (y1 - y3) / denom, -0.5, 0.5);
+        }
+        const double candFreq = (static_cast<double>(k) + delta) *
+                                static_cast<double>(binWidthHz);
+        if (candFreq >= cfg::kTunerMinHz && candFreq <= cfg::kTunerMaxHz) {
+            bestMag  = m;
+            bestFreq = candFreq;
         }
     }
 
-    // Noise gate: ignore peaks below threshold so room noise doesn't trigger the tuner.
-    if (peakMag < cfg::kTunerGateMag) return out;
-
-    // Parabolic interpolation across (peakBin - 1, peakBin, peakBin + 1).
-    // Raising Hann-windowed magnitudes to p = 0.23 makes the Hann main lobe closely
-    // parabolic, cutting sub-cent interpolation bias down from ~30 ct to < 1 ct at 30 Hz.
-    constexpr double kHannPower = 0.23;
-    const double y1 = std::pow(std::max(static_cast<double>(magnitudes[peakBin - 1]), 1e-12), kHannPower);
-    const double y2 = std::pow(std::max(static_cast<double>(magnitudes[peakBin]),     1e-12), kHannPower);
-    const double y3 = std::pow(std::max(static_cast<double>(magnitudes[peakBin + 1]), 1e-12), kHannPower);
-
-    const double denom = y1 - 2.0 * y2 + y3;
-    double delta = 0.0;
-    if (std::fabs(denom) > 1e-12) {
-        delta = std::clamp(0.5 * (y1 - y3) / denom, -0.5, 0.5);
-    }
-
-    const double interpFreq = (static_cast<double>(peakBin) + delta) *
-                              static_cast<double>(binWidthHz);
-    if (interpFreq < cfg::kTunerMinHz || interpFreq > cfg::kTunerMaxHz) return out;
+    if (bestMag < cfg::kTunerGateMag) return out;
+    const double interpFreq = bestFreq;
 
     // Pitch math: n = 12 * log2(freq / 440.0) semitones from A4 (MIDI 69).
     const double n               = 12.0 * std::log2(interpFreq / 440.0);
@@ -457,6 +461,7 @@ int main() {
         double sumSq = 0.0;
         float  peak  = 0.0f;
         for (float& s : samples) {
+            if (!std::isfinite(s)) s = 0.0f;
             s *= gain;
             sumSq += static_cast<double>(s) * s;
             peak = std::max(peak, std::fabs(s));
