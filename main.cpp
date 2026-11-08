@@ -86,7 +86,7 @@ constexpr ma_uint32 kSampleRate     = 48000;
 constexpr ma_uint32 kChannelsIn     = 2;
 constexpr ma_uint32 kChannelsOut    = 2;
 constexpr ma_uint32 kPeriodFrames   = 128;
-constexpr ma_uint32 kPeriods        = 2;
+constexpr ma_uint32 kPeriods        = 1;
 
 // Analysis
 constexpr size_t    kFftSize        = 4096;            // Power of 2 (bin width = 11.72 Hz)
@@ -420,7 +420,7 @@ public:
 
     // Opens WASAPI full duplex: shared mode first (preserves mic-array beamforming,
     // boost, and acoustic echo/noise APOs), exclusive mode as fallback.
-    bool Start() {
+    bool Start(bool preferExclusive = false) {
         if (running_) return true;
 #if defined(_WIN32)
         const ma_backend backends[] = { ma_backend_wasapi };
@@ -429,10 +429,12 @@ public:
         if (ma_context_init(nullptr, 0, nullptr, &context_) != MA_SUCCESS) return false;
 #endif
         contextOk_ = true;
-        if (TryStart(ma_share_mode_shared)) {
-            exclusive_ = false;
-        } else if (TryStart(ma_share_mode_exclusive)) {
-            exclusive_ = true;
+        const ma_share_mode first  = preferExclusive ? ma_share_mode_exclusive : ma_share_mode_shared;
+        const ma_share_mode second = preferExclusive ? ma_share_mode_shared    : ma_share_mode_exclusive;
+        if (TryStart(first)) {
+            exclusive_ = (first == ma_share_mode_exclusive);
+        } else if (TryStart(second)) {
+            exclusive_ = (second == ma_share_mode_exclusive);
         } else {
             ma_context_uninit(&context_);
             contextOk_ = false;
@@ -440,6 +442,12 @@ public:
         }
         running_ = true;
         return true;
+    }
+
+    bool ToggleDriverMode() {
+        const bool targetExclusive = !exclusive_;
+        Stop();
+        return Start(targetExclusive);
     }
 
     void Stop() noexcept {
@@ -575,6 +583,7 @@ private:
         config.periodSizeInFrames       = cfg::kPeriodFrames;
         config.periods                  = cfg::kPeriods;
         config.performanceProfile       = ma_performance_profile_low_latency;
+        config.wasapi.usage             = ma_wasapi_usage_pro_audio;
         config.wasapi.noAutoConvertSRC  = (shareMode == ma_share_mode_exclusive) ? MA_TRUE : MA_FALSE;
         config.dataCallback             = DataCallback;
         config.pUserData                = this;
@@ -1113,6 +1122,7 @@ int main() {
         if (IsKeyPressed(KEY_C))     engine->ToggleCab();
         if (IsKeyPressed(KEY_I))     engine->CycleInput();
         if (IsKeyPressed(KEY_SPACE)) engine->ToggleMute();
+        if (IsKeyPressed(KEY_E))     engine->ToggleDriverMode();
 
         // 2. Telemetry
         UpdatePeakMeter(inMeterDb,  engine->ConsumeInputPeak(),  dt);
