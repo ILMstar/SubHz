@@ -1,13 +1,16 @@
 // =====================================================================================
 //  SubHz - Full-Duplex Audio & Bass DSP Rig, Visualizer & Tuner (C++17, raylib, miniaudio)
 //
-//  Audio thread (WASAPI duplex, shared mode default for mic APOs, exclusive fallback):
+//  Audio thread (WASAPI duplex, shared mode default for mic APOs, exclusive [E] toggle):
 //    IN (1+2 / 1 / 2) -> Trim -> [DcBlocker: HPF 28 Hz]
 //                                   |  (DC-blocked, pre-FX) -> dryBuffer -> Tuner
 //                                   v
-//                              [EnvelopeNoiseGate (G)] -> [CabSim: LPF 4.5 kHz (C)]
+//                              [EnvelopeNoiseGate (G)] -> [Compressor (Optical 4:1)]
 //                                   v
-//                              Soft-knee tanh limiter -> wetBuffer -> Scope + FFT
+//                              [BassOverdrive: 150 Hz Split (O)] -> [ThreeBandEq (5-0)]
+//                                   v
+//                              [CabSim: LPF 4.5 kHz (C)] -> Soft-knee tanh limiter
+//                                   | -> wetBuffer -> Scope + FFT
 //                                   v
 //                              Mute ramp -> OUT (dual mono L/R)
 //
@@ -21,7 +24,9 @@
 // -------------------------------------------------------------------------------------
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
-    #define NOMINMAX
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #define Rectangle   Win32_Rectangle
     #define CloseWindow Win32_CloseWindow
     #define ShowCursor  Win32_ShowCursor
@@ -98,16 +103,37 @@ constexpr float     kTrimMax        = 100.0f;          // +40 dB
 constexpr float     kTrimStepDb     = 1.0f;
 
 // DSP chain
-constexpr float     kDcBlockHz      = 28.0f;
-constexpr float     kCabLpfHz       = 4500.0f;
-constexpr float     kCabToggleMs    = 10.0f;           // click-free cab crossfade
-constexpr float     kGateOpenDb     = -54.0f;          // hysteresis: open above ...
-constexpr float     kGateCloseDb    = -62.0f;          // ... close below (8 dB window)
-constexpr float     kGateAttackMs   = 1.0f;
-constexpr float     kGateReleaseMs  = 80.0f;
-constexpr float     kLimiterKnee    = 0.70f;           // linear below (-3.1 dBFS)
-constexpr float     kLimiterCeiling = 0.98f;           // asymptotic tanh ceiling
-constexpr float     kMuteRampMs     = 5.0f;
+constexpr float     kDcBlockHz          = 28.0f;
+constexpr float     kCabLpfHz           = 4500.0f;
+constexpr float     kCabToggleMs        = 10.0f;       // click-free cab/bypass crossfade
+constexpr float     kGateOpenDb         = -54.0f;      // hysteresis: open above ...
+constexpr float     kGateCloseDb        = -62.0f;      // ... close below (8 dB window)
+constexpr float     kGateAttackMs       = 1.0f;
+constexpr float     kGateReleaseMs      = 80.0f;
+constexpr float     kCompAttackMs       = 10.0f;       // optical-style feed-forward attack
+constexpr float     kCompReleaseMs      = 120.0f;      // smooth optical release
+constexpr float     kCompRatio          = 4.0f;        // 4:1 bass compression
+constexpr float     kCompDefaultThreshDb = -18.0f;
+constexpr float     kCompDefaultMakeupDb = 1.5f;
+constexpr float     kOverdriveCrossHz   = 150.0f;      // split-band crossover (<150 Hz clean)
+constexpr float     kDriveMin           = 1.0f;
+constexpr float     kDriveMax           = 25.0f;
+constexpr float     kDriveStep          = 0.5f;
+constexpr float     kBlendMin           = 0.0f;
+constexpr float     kBlendMax           = 1.0f;
+constexpr float     kBlendStep          = 0.05f;
+constexpr float     kEqMinDb            = -15.0f;
+constexpr float     kEqMaxDb            = 15.0f;
+constexpr float     kEqStepDb           = 0.5f;
+constexpr float     kEqBassHz           = 80.0f;       // Low-shelf
+constexpr float     kEqBassQ            = 0.70710678f;
+constexpr float     kEqMidHz            = 650.0f;      // Peaking
+constexpr float     kEqMidQ             = 1.0f;
+constexpr float     kEqTrebleHz         = 3200.0f;     // High-shelf
+constexpr float     kEqTrebleQ          = 0.70710678f;
+constexpr float     kLimiterKnee        = 0.70f;       // linear below (-3.1 dBFS)
+constexpr float     kLimiterCeiling     = 0.98f;       // asymptotic tanh ceiling
+constexpr float     kMuteRampMs         = 5.0f;
 
 // Spectrum analyzer (20 Hz - 10 kHz log scale devotes ~74% width to 20 - 2000 Hz)
 constexpr int       kNumBars        = 160;
@@ -325,6 +351,272 @@ private:
 };
 
 // -------------------------------------------------------------------------------------
+//  CompressorNode: Optical-style feed-forward bass compressor (10 ms attack, 120 ms
+//  release, 4:1 ratio). Caches linear threshold/makeup gains and skips log/pow math
+//  whenever the envelope sits below threshold. Publishes smoothed gainReductionDb.
+// -------------------------------------------------------------------------------------
+class CompressorNode final : public IDspNode {
+public:
+    float process(float sample, float sampleRate) noexcept override {
+        const float threshDb = thresholdDb_.load(std::memory_order_relaxed);
+        const float makeupDb = makeupGainDb_.load(std::memory_order_relaxed);
+        if (sampleRate != cachedRate_ || threshDb != cachedThreshDb_ || makeupDb != cachedMakeupDb_) {
+            cachedRate_     = sampleRate;
+            cachedThreshDb_ = threshDb;
+            cachedMakeupDb_ = makeupDb;
+            peakAttack_     = OnePoleCoeff(1.0f, sampleRate);
+            attackCoeff_    = OnePoleCoeff(cfg::kCompAttackMs, sampleRate);
+            releaseCoeff_   = OnePoleCoeff(cfg::kCompReleaseMs, sampleRate);
+            thresholdLin_   = DbToLin(threshDb);
+            makeupLin_      = DbToLin(makeupDb);
+        }
+
+        const float level    = std::fabs(sample);
+        const float envCoeff = level > envelope_ ? peakAttack_ : releaseCoeff_;
+        envelope_ += (level - envelope_) * envCoeff;
+        if (!std::isfinite(envelope_)) envelope_ = 0.0f;
+
+        float targetGrDb = 0.0f;
+        if (envelope_ > thresholdLin_ && thresholdLin_ > 1e-6f) {
+            constexpr float kSlope = 1.0f - (1.0f / cfg::kCompRatio);   // 0.75 for 4:1
+            const float overDb = 20.0f * std::log10(envelope_ / thresholdLin_);
+            targetGrDb = kSlope * overDb;
+        }
+
+        const float grCoeff = targetGrDb > grMeterDb_ ? attackCoeff_ : releaseCoeff_;
+        grMeterDb_ += (targetGrDb - grMeterDb_) * grCoeff;
+        gainReductionDb_.store(grMeterDb_, std::memory_order_relaxed);
+
+        const float compGain = grMeterDb_ > 1e-4f ? DbToLin(-grMeterDb_) : 1.0f;
+        return sample * (compGain * makeupLin_);
+    }
+
+    void  SetThresholdDb(float db) noexcept {
+        thresholdDb_.store(std::clamp(db, -48.0f, 0.0f), std::memory_order_relaxed);
+    }
+    float ThresholdDb() const noexcept { return thresholdDb_.load(std::memory_order_relaxed); }
+
+    void  SetMakeupGainDb(float db) noexcept {
+        makeupGainDb_.store(std::clamp(db, -12.0f, 24.0f), std::memory_order_relaxed);
+    }
+    float MakeupGainDb() const noexcept { return makeupGainDb_.load(std::memory_order_relaxed); }
+
+    float GainReductionDb() const noexcept {
+        return gainReductionDb_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<float> thresholdDb_{cfg::kCompDefaultThreshDb};
+    std::atomic<float> makeupGainDb_{cfg::kCompDefaultMakeupDb};
+    std::atomic<float> gainReductionDb_{0.0f};
+
+    float cachedRate_     = 0.0f;
+    float cachedThreshDb_ = -999.0f;
+    float cachedMakeupDb_ = -999.0f;
+    float peakAttack_     = 1.0f;
+    float attackCoeff_    = 1.0f;
+    float releaseCoeff_   = 1.0f;
+    float thresholdLin_   = 1.0f;
+    float makeupLin_      = 1.0f;
+    float envelope_       = 0.0f;
+    float grMeterDb_      = 0.0f;
+};
+
+// -------------------------------------------------------------------------------------
+//  BassOverdriveNode: 1st-order complementary crossover at 150 Hz splits the signal into
+//  a clean tight lowBand (<150 Hz) and a highBand (>150 Hz) driven through asymmetric
+//  tube-style soft clipping: tanh(highBand * drive + 0.1) - tanh(0.1) with automatic
+//  gain compensation. Recombines phase-coherently with dry/wet blend and bypass.
+// -------------------------------------------------------------------------------------
+class BassOverdriveNode final : public IDspNode {
+public:
+    float process(float sample, float sampleRate) noexcept override {
+        const float driveVal = drive_.load(std::memory_order_relaxed);
+        if (sampleRate != cachedRate_ || driveVal != cachedDrive_) {
+            cachedRate_  = sampleRate;
+            cachedDrive_ = driveVal;
+            lpCoeff_     = static_cast<float>(
+                1.0 - std::exp(-2.0 * cfg::kPi * cfg::kOverdriveCrossHz / sampleRate));
+            mixCoeff_    = OnePoleCoeff(cfg::kCabToggleMs, sampleRate);
+            driveComp_   = 1.0f / std::pow( std::max(driveVal, 1.0f), 0.55f);
+        }
+
+        // Complementary 1st-order crossover at 150 Hz (lowBand + highBand == sample)
+        lowBand_ += lpCoeff_ * (sample - lowBand_);
+        if (!std::isfinite(lowBand_)) lowBand_ = 0.0f;
+        const float lowBand  = lowBand_;
+        const float highBand = sample - lowBand;
+
+        // Asymmetric tube-style saturation on highBand (>150 Hz) + auto gain compensation
+        constexpr float kBias     = 0.1f;
+        const float     kBiasTanh = std::tanh(kBias);
+        const float     drivenHi  = (std::tanh(highBand * driveVal + kBias) - kBiasTanh) * driveComp_;
+        const float     recombined = lowBand + drivenHi;
+
+        const bool  isBypassed  = bypass_.load(std::memory_order_relaxed);
+        const float targetBlend = isBypassed ? 0.0f : blend_.load(std::memory_order_relaxed);
+        smoothBlend_ += (targetBlend - smoothBlend_) * mixCoeff_;
+
+        return sample + smoothBlend_ * (recombined - sample);
+    }
+
+    void  SetBypass(bool b) noexcept { bypass_.store(b, std::memory_order_relaxed); }
+    bool  Bypass() const noexcept { return bypass_.load(std::memory_order_relaxed); }
+    void  SetDrive(float d) noexcept {
+        drive_.store(std::clamp(d, cfg::kDriveMin, cfg::kDriveMax), std::memory_order_relaxed);
+    }
+    float Drive() const noexcept { return drive_.load(std::memory_order_relaxed); }
+    void  SetBlend(float b) noexcept {
+        blend_.store(std::clamp(b, cfg::kBlendMin, cfg::kBlendMax), std::memory_order_relaxed);
+    }
+    float Blend() const noexcept { return blend_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<bool>  bypass_{true};
+    std::atomic<float> drive_{2.0f};
+    std::atomic<float> blend_{0.0f};
+
+    float cachedRate_  = 0.0f;
+    float cachedDrive_ = -1.0f;
+    float lpCoeff_     = 1.0f;
+    float mixCoeff_    = 1.0f;
+    float driveComp_   = 1.0f;
+    float lowBand_     = 0.0f;
+    float smoothBlend_ = 0.0f;
+};
+
+// -------------------------------------------------------------------------------------
+//  ThreeBandEqNode: 3 cascaded RBJ Audio EQ Cookbook biquad filters in Transposed
+//  Direct Form II (Bass low-shelf 80 Hz Q=0.707, Mid peaking 650 Hz Q=1.0, Treble
+//  high-shelf 3200 Hz Q=0.707). Recomputes biquad coefficients ONLY when an atomic dB
+//  parameter or sampleRate changes. Flushes z1/z2 state if NaN/Inf ever occurs.
+// -------------------------------------------------------------------------------------
+class ThreeBandEqNode final : public IDspNode {
+public:
+    float process(float sample, float sampleRate) noexcept override {
+        const float bass   = bassDb_.load(std::memory_order_relaxed);
+        const float mid    = midDb_.load(std::memory_order_relaxed);
+        const float treble = trebleDb_.load(std::memory_order_relaxed);
+        const bool  rateChanged = (sampleRate != cachedRate_);
+
+        if (rateChanged || bass != cachedBassDb_) {
+            cachedBassDb_ = bass;
+            UpdateLowShelf(bands_[0], cfg::kEqBassHz, cfg::kEqBassQ, bass, sampleRate);
+        }
+        if (rateChanged || mid != cachedMidDb_) {
+            cachedMidDb_ = mid;
+            UpdatePeaking(bands_[1], cfg::kEqMidHz, cfg::kEqMidQ, mid, sampleRate);
+        }
+        if (rateChanged || treble != cachedTrebleDb_) {
+            cachedTrebleDb_ = treble;
+            UpdateHighShelf(bands_[2], cfg::kEqTrebleHz, cfg::kEqTrebleQ, treble, sampleRate);
+        }
+        cachedRate_ = sampleRate;
+
+        if (!std::isfinite(sample)) {
+            for (Biquad& bq : bands_) {
+                bq.z1 = 0.0;
+                bq.z2 = 0.0;
+            }
+            return 0.0f;
+        }
+
+        double x = static_cast<double>(sample);
+        for (Biquad& bq : bands_) {
+            const double y = bq.b0 * x + bq.z1;
+            bq.z1 = bq.b1 * x - bq.a1 * y + bq.z2;
+            bq.z2 = bq.b2 * x - bq.a2 * y;
+            if (!std::isfinite(y) || !std::isfinite(bq.z1) || !std::isfinite(bq.z2)) {
+                bq.z1 = 0.0;
+                bq.z2 = 0.0;
+                x     = 0.0;
+            } else {
+                x = y;
+            }
+        }
+        return static_cast<float>(x);
+    }
+
+    void  SetBassDb(float db) noexcept {
+        bassDb_.store(std::clamp(db, cfg::kEqMinDb, cfg::kEqMaxDb), std::memory_order_relaxed);
+    }
+    float BassDb() const noexcept { return bassDb_.load(std::memory_order_relaxed); }
+
+    void  SetMidDb(float db) noexcept {
+        midDb_.store(std::clamp(db, cfg::kEqMinDb, cfg::kEqMaxDb), std::memory_order_relaxed);
+    }
+    float MidDb() const noexcept { return midDb_.load(std::memory_order_relaxed); }
+
+    void  SetTrebleDb(float db) noexcept {
+        trebleDb_.store(std::clamp(db, cfg::kEqMinDb, cfg::kEqMaxDb), std::memory_order_relaxed);
+    }
+    float TrebleDb() const noexcept { return trebleDb_.load(std::memory_order_relaxed); }
+
+private:
+    struct Biquad {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+        double z1 = 0.0, z2 = 0.0;
+    };
+
+    static void UpdateLowShelf(Biquad& bq, float fc, float q, float gainDb, float sr) noexcept {
+        const double A     = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const double w0    = 2.0 * cfg::kPi * static_cast<double>(fc) / static_cast<double>(sr);
+        const double cosw  = std::cos(w0);
+        const double sinw  = std::sin(w0);
+        const double alpha = sinw / (2.0 * static_cast<double>(q));
+        const double beta  = 2.0 * std::sqrt(A) * alpha;
+
+        const double a0 = (A + 1.0) + (A - 1.0) * cosw + beta;
+        bq.b0 = (A * ((A + 1.0) - (A - 1.0) * cosw + beta)) / a0;
+        bq.b1 = (2.0 * A * ((A - 1.0) - (A + 1.0) * cosw)) / a0;
+        bq.b2 = (A * ((A + 1.0) - (A - 1.0) * cosw - beta)) / a0;
+        bq.a1 = (-2.0 * ((A - 1.0) + (A + 1.0) * cosw)) / a0;
+        bq.a2 = ((A + 1.0) + (A - 1.0) * cosw - beta) / a0;
+    }
+
+    static void UpdatePeaking(Biquad& bq, float fc, float q, float gainDb, float sr) noexcept {
+        const double A     = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const double w0    = 2.0 * cfg::kPi * static_cast<double>(fc) / static_cast<double>(sr);
+        const double cosw  = std::cos(w0);
+        const double sinw  = std::sin(w0);
+        const double alpha = sinw / (2.0 * static_cast<double>(q));
+
+        const double a0 = 1.0 + alpha / A;
+        bq.b0 = (1.0 + alpha * A) / a0;
+        bq.b1 = (-2.0 * cosw) / a0;
+        bq.b2 = (1.0 - alpha * A) / a0;
+        bq.a1 = bq.b1;
+        bq.a2 = (1.0 - alpha / A) / a0;
+    }
+
+    static void UpdateHighShelf(Biquad& bq, float fc, float q, float gainDb, float sr) noexcept {
+        const double A     = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const double w0    = 2.0 * cfg::kPi * static_cast<double>(fc) / static_cast<double>(sr);
+        const double cosw  = std::cos(w0);
+        const double sinw  = std::sin(w0);
+        const double alpha = sinw / (2.0 * static_cast<double>(q));
+        const double beta  = 2.0 * std::sqrt(A) * alpha;
+
+        const double a0 = (A + 1.0) - (A - 1.0) * cosw + beta;
+        bq.b0 = (A * ((A + 1.0) + (A - 1.0) * cosw + beta)) / a0;
+        bq.b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * cosw)) / a0;
+        bq.b2 = (A * ((A + 1.0) + (A - 1.0) * cosw - beta)) / a0;
+        bq.a1 = (2.0 * ((A - 1.0) - (A + 1.0) * cosw)) / a0;
+        bq.a2 = ((A + 1.0) - (A - 1.0) * cosw - beta) / a0;
+    }
+
+    std::atomic<float> bassDb_{0.0f};
+    std::atomic<float> midDb_{0.0f};
+    std::atomic<float> trebleDb_{0.0f};
+
+    float  cachedRate_     = 0.0f;
+    float  cachedBassDb_   = -999.0f;
+    float  cachedMidDb_    = -999.0f;
+    float  cachedTrebleDb_ = -999.0f;
+    std::array<Biquad, 3> bands_{};
+};
+
+// -------------------------------------------------------------------------------------
 //  CabSimNode: toggleable 2nd-order Butterworth LPF "cab sim" (4.5 kHz). Defaults OFF
 //  for full-range voice clarity; LPF state always runs warm for 10 ms click-free [C]
 //  crossfades when engaging bass cabinet roll-off.
@@ -387,6 +679,26 @@ inline float SoftKneeLimit(float x, bool& engaged) noexcept {
 // -------------------------------------------------------------------------------------
 enum class InputSelect : int { In1 = 0, In2 = 1, Sum = 2 };
 
+struct TonePreset {
+    const char* name;
+    float       compThreshDb;
+    float       compMakeupDb;
+    bool        odBypass;
+    float       odDrive;
+    float       odBlend;
+    float       bassDb;
+    float       midDb;
+    float       trebleDb;
+    bool        cabEnabled;
+};
+
+static constexpr std::array<TonePreset, 4> kPresets = {{
+    { "Clean Studio DI",        -18.0f, 1.5f, true,   2.0f, 0.00f,  0.0f,  0.0f,  0.0f, false },
+    { "Warm Motown Vintage",    -20.0f, 2.5f, true,   3.0f, 0.25f,  4.0f,  2.0f, -6.0f, true  },
+    { "Modern Slap Scoop",      -26.0f, 5.0f, true,   4.0f, 0.30f,  5.0f, -6.0f,  6.0f, false },
+    { "Darkglass Clank / Grit", -22.0f, 3.5f, false, 12.0f, 0.65f,  4.0f,  3.0f,  4.0f, true  },
+}};
+
 struct LatencyInfo {
     ma_uint32 periodFrames = 0;
     ma_uint32 periods      = 0;
@@ -401,17 +713,27 @@ public:
 
     AudioEngine() {
         // Chain is fully built (and never resized) before the device starts:
-        // [DcBlocker 28 Hz] -> [EnvelopeNoiseGate] -> [CabSim 4.5 kHz LPF]
+        // [DcBlocker 28Hz] -> [NoiseGate] -> [Compressor] -> [Overdrive] -> [3BandEQ] -> [CabSim]
         auto dcBlocker = std::make_unique<DcBlockerNode>();
         auto gate      = std::make_unique<EnvelopeNoiseGateNode>();
+        auto comp      = std::make_unique<CompressorNode>();
+        auto overdrive = std::make_unique<BassOverdriveNode>();
+        auto eq        = std::make_unique<ThreeBandEqNode>();
         auto cab       = std::make_unique<CabSimNode>();
         dcBlocker_ = dcBlocker.get();
         gate_      = gate.get();
+        comp_      = comp.get();
+        overdrive_ = overdrive.get();
+        eq_        = eq.get();
         cab_       = cab.get();
-        dspChain_.reserve(3);
+        dspChain_.reserve(6);
         dspChain_.push_back(std::move(dcBlocker));
         dspChain_.push_back(std::move(gate));
+        dspChain_.push_back(std::move(comp));
+        dspChain_.push_back(std::move(overdrive));
+        dspChain_.push_back(std::move(eq));
         dspChain_.push_back(std::move(cab));
+        ApplyPreset(0);
         SetSampleRate(static_cast<float>(cfg::kSampleRate));
     }
     ~AudioEngine() { Stop(); }
@@ -523,7 +845,10 @@ public:
     }
     void  ToggleMute() noexcept { muted_.store(!Muted(), std::memory_order_relaxed); }
     bool  Muted() const noexcept { return muted_.load(std::memory_order_relaxed); }
-    void  ToggleCab() noexcept { cab_->SetCabEnabled(!cab_->CabEnabled()); }
+    void  ToggleCab() noexcept {
+        cab_->SetCabEnabled(!cab_->CabEnabled());
+        presetModified_ = true;
+    }
     bool  CabEnabled() const noexcept { return cab_->CabEnabled(); }
     void  ToggleGate() noexcept { gate_->SetEnabled(!gate_->Enabled()); }
     bool  GateEnabled() const noexcept { return gate_->Enabled(); }
@@ -532,6 +857,64 @@ public:
     }
     float Trim() const noexcept { return trim_.load(std::memory_order_relaxed); }
     bool  GateOpen() const noexcept { return gate_->IsOpen(); }
+
+    // ---- Phase 2 DSP controls & presets ---------------------------------------------
+    void  ToggleOverdrive() noexcept {
+        overdrive_->SetBypass(!overdrive_->Bypass());
+        presetModified_ = true;
+    }
+    bool  OverdriveEnabled() const noexcept { return !overdrive_->Bypass(); }
+    void  SetDrive(float d) noexcept {
+        overdrive_->SetDrive(d);
+        presetModified_ = true;
+    }
+    float Drive() const noexcept { return overdrive_->Drive(); }
+    void  SetBlend(float b) noexcept {
+        overdrive_->SetBlend(b);
+        presetModified_ = true;
+    }
+    float Blend() const noexcept { return overdrive_->Blend(); }
+
+    void  SetBassDb(float db) noexcept {
+        eq_->SetBassDb(db);
+        presetModified_ = true;
+    }
+    float BassDb() const noexcept { return eq_->BassDb(); }
+    void  SetMidDb(float db) noexcept {
+        eq_->SetMidDb(db);
+        presetModified_ = true;
+    }
+    float MidDb() const noexcept { return eq_->MidDb(); }
+    void  SetTrebleDb(float db) noexcept {
+        eq_->SetTrebleDb(db);
+        presetModified_ = true;
+    }
+    float TrebleDb() const noexcept { return eq_->TrebleDb(); }
+
+    float CompGainReductionDb() const noexcept { return comp_->GainReductionDb(); }
+    float CompThresholdDb() const noexcept { return comp_->ThresholdDb(); }
+    float CompMakeupDb() const noexcept { return comp_->MakeupGainDb(); }
+
+    void ApplyPreset(int index) noexcept {
+        presetIndex_    = ((index % static_cast<int>(kPresets.size())) +
+                           static_cast<int>(kPresets.size())) %
+                          static_cast<int>(kPresets.size());
+        presetModified_ = false;
+        const TonePreset& p = kPresets[presetIndex_];
+        comp_->SetThresholdDb(p.compThreshDb);
+        comp_->SetMakeupGainDb(p.compMakeupDb);
+        overdrive_->SetBypass(p.odBypass);
+        overdrive_->SetDrive(p.odDrive);
+        overdrive_->SetBlend(p.odBlend);
+        eq_->SetBassDb(p.bassDb);
+        eq_->SetMidDb(p.midDb);
+        eq_->SetTrebleDb(p.trebleDb);
+        cab_->SetCabEnabled(p.cabEnabled);
+    }
+    void        CyclePreset() noexcept { ApplyPreset(presetIndex_ + 1); }
+    int         PresetIndex() const noexcept { return presetIndex_; }
+    const char* PresetName() const noexcept { return kPresets[presetIndex_].name; }
+    bool        PresetModified() const noexcept { return presetModified_; }
 
     // ---- Telemetry (UI thread consumes and resets) ----------------------------------
     float ConsumeInputPeak() noexcept  { return inputPeak_.exchange(0.0f, std::memory_order_relaxed); }
@@ -617,6 +1000,9 @@ private:
     std::vector<std::unique_ptr<IDspNode>> dspChain_;
     DcBlockerNode*                         dcBlocker_ = nullptr;
     EnvelopeNoiseGateNode*                 gate_      = nullptr;
+    CompressorNode*                        comp_      = nullptr;
+    BassOverdriveNode*                     overdrive_ = nullptr;
+    ThreeBandEqNode*                       eq_        = nullptr;
     CabSimNode*                            cab_       = nullptr;
 
     History dryBuffer_;   // Pre-FX tap  -> tuner
@@ -636,6 +1022,8 @@ private:
     std::atomic<float> inputPeak_{0.0f};
     std::atomic<float> outputPeak_{0.0f};
     std::atomic<bool>  limitEvent_{false};
+    int                presetIndex_    = 0;
+    bool               presetModified_ = false;
 
     // Device
     ma_context  context_{};
@@ -859,7 +1247,8 @@ static void DrawStatusBar(const AudioEngine& engine) {
     if (!engine.Running()) {
         DrawChip(x, kChipY, "NO AUDIO DEVICE (WASAPI)", kFont, RAYWHITE, cfg::kTuneRed);
     } else {
-        x += DrawChip(x, kChipY, engine.Exclusive() ? "WASAPI EXCLUSIVE" : "WASAPI SHARED",
+        x += DrawChip(x, kChipY,
+                      engine.Exclusive() ? "WASAPI EXCLUSIVE [E]" : "WASAPI SHARED [E]",
                       kFont, cfg::kBackground,
                       engine.Exclusive() ? cfg::kNeon : cfg::kTuneGreen) + kGap;
 
@@ -878,7 +1267,10 @@ static void DrawStatusBar(const AudioEngine& engine) {
         x += DrawChip(x, kChipY, engine.GateEnabled() ? "GATE: ON [G]" : "GATE: OFF [G]",
                       kFont, engine.GateEnabled() ? cfg::kTuneGreen : GRAY, chipBg) + kGap;
 
-        x += DrawChip(x, kChipY, engine.CabEnabled() ? "CAB: 4.5kHz LPF [C]" : "CAB: OFF [C]",
+        x += DrawChip(x, kChipY, engine.OverdriveEnabled() ? "OD: ON [O]" : "OD: OFF [O]",
+                      kFont, engine.OverdriveEnabled() ? cfg::kTuneOrange : GRAY, chipBg) + kGap;
+
+        x += DrawChip(x, kChipY, engine.CabEnabled() ? "CAB: 4.5k [C]" : "CAB: OFF [C]",
                       kFont, engine.CabEnabled() ? cfg::kTuneGreen : GRAY, chipBg) + kGap;
 
         DrawChip(x, kChipY, engine.Muted() ? "MUTED [SPACE]" : "LIVE [SPACE]", kFont,
@@ -932,8 +1324,21 @@ static void DrawTelemetryPanel(const AudioEngine& engine, float inDb, float outD
     DrawText(TextFormat("TRIM x%.2f (%+.1f dB)  [Up/Down, R]", engine.Trim(),
                         20.0f * std::log10(engine.Trim())),
              kX, kY, 16, LIGHTGRAY);
-    DrawPeakMeter(kX, kY + 28, kW, 14, "IN", inDb);
-    DrawPeakMeter(kX, kY + 50, kW, 14, "OUT", outDb);
+    DrawPeakMeter(kX, kY + 22, kW, 12, "IN", inDb);
+    DrawPeakMeter(kX, kY + 40, kW, 12, "OUT", outDb);
+
+    // Compressor Gain Reduction (GR) meter (0..18 dB scale)
+    const int   grY    = kY + 58;
+    const int   barX   = kX + 40;
+    const int   barW   = kW - 40 - 76;
+    const float grDb   = std::clamp(engine.CompGainReductionDb(), 0.0f, 18.0f);
+    const int   fillW  = static_cast<int>(std::round((grDb / 18.0f) * barW));
+    DrawText("GR", kX, grY - 1, 14, LIGHTGRAY);
+    DrawRectangle(barX, grY, barW, 12, Color{ 0x10, 0x10, 0x10, 0xFF });
+    if (fillW > 0) DrawRectangle(barX, grY + 1, fillW, 10, cfg::kTuneOrange);
+    DrawRectangleLines(barX, grY, barW, 12, cfg::kGrid);
+    DrawText(TextFormat("-%.1f dB", engine.CompGainReductionDb()),
+             barX + barW + 8, grY - 1, 14, grDb > 0.2f ? cfg::kTuneOrange : GRAY);
 
     // LIMIT LED
     const int ledY = kY + 78;
@@ -953,19 +1358,28 @@ static void DrawTelemetryPanel(const AudioEngine& engine, float inDb, float outD
     DrawText(gateTxt, kX + 110, ledY, 14,
              !gateEnabled ? GRAY : (gateOpen ? cfg::kTuneGreen : DARKGRAY));
 
-    DrawText(TextFormat("open %.0f / close %.0f dBFS", cfg::kGateOpenDb, cfg::kGateCloseDb),
+    DrawText(TextFormat("COMP %.0fdB / %+.1fdB (4:1)", engine.CompThresholdDb(),
+                        engine.CompMakeupDb()),
              kX + 224, ledY + 1, 12, DARKGRAY);
 }
 
 static void DrawSignalFlowPanel(const AudioEngine& engine) {
     constexpr int kX = 864;
     constexpr int kY = 46;
-    DrawText("SIGNAL FLOW", kX, kY, 14, GRAY);
-    DrawText("IN > TRIM > HPF 28Hz > GATE > CAB > LIMIT > OUT", kX, kY + 20, 12, LIGHTGRAY);
-    DrawText("DRY tap (DC-blocked, pre-FX)  -> TUNER", kX, kY + 38, 12, cfg::kNeonLow);
-    DrawText("WET tap (post-limiter)        -> SCOPE + FFT", kX, kY + 54, 12, cfg::kNeon);
-    DrawText(TextFormat("In:  %.44s", engine.CaptureName()), kX, kY + 76, 12, DARKGRAY);
-    DrawText(TextFormat("Out: %.44s", engine.PlaybackName()), kX, kY + 92, 12, DARKGRAY);
+    DrawText(TextFormat("PRESET [P]: %s%s", engine.PresetName(),
+                        engine.PresetModified() ? " *" : ""),
+             kX, kY, 14, cfg::kNeon);
+    DrawText("IN > HPF > GATE > COMP > OD > EQ > CAB > LIM", kX, kY + 18, 12, LIGHTGRAY);
+    DrawText(TextFormat("OD [O]: %-3s  Drive [1/2]: %4.1fx  Blend [3/4]: %3d%%",
+                        engine.OverdriveEnabled() ? "ON" : "OFF",
+                        engine.Drive(),
+                        static_cast<int>(std::round(engine.Blend() * 100.0f))),
+             kX, kY + 36, 12, engine.OverdriveEnabled() ? cfg::kTuneOrange : GRAY);
+    DrawText(TextFormat("EQ (dB)  Bass [5/6]: %+5.1f  Mid [7/8]: %+5.1f  Treb [9/0]: %+5.1f",
+                        engine.BassDb(), engine.MidDb(), engine.TrebleDb()),
+             kX, kY + 54, 12, cfg::kNeonLow);
+    DrawText(TextFormat("In:  %.44s", engine.CaptureName()), kX, kY + 74, 12, DARKGRAY);
+    DrawText(TextFormat("Out: %.44s", engine.PlaybackName()), kX, kY + 90, 12, DARKGRAY);
 }
 
 // -------------------------------------------------------------------------------------
@@ -1098,7 +1512,42 @@ int main() {
     float outMeterDb   = cfg::kMeterFloorDb;
     float limitLedTime = 0.0f;
 
-    const float binWidthHz = engine->SampleRate() / static_cast<float>(cfg::kFftSize);
+    const float binWidthHz  = engine->SampleRate() / static_cast<float>(cfg::kFftSize);
+    const float logMin      = std::log10(cfg::kMinFreq);
+    const float logMax      = std::log10(cfg::kMaxFreq);
+    const float maxValidBin = std::min(static_cast<float>(cfg::kHalfBins),
+                                       cfg::kMaxFreq / binWidthHz);
+
+    // Precompute logarithmic spectrum bar bin bounds (eliminates 57,600 std::pow/sec)
+    struct BarBinSpec {
+        bool   subBin;
+        size_t k0;
+        size_t k1;
+        float  frac;
+    };
+    std::array<BarBinSpec, cfg::kNumBars> barSpecs{};
+    for (int b = 0; b < cfg::kNumBars; ++b) {
+        const float t0   = static_cast<float>(b) / cfg::kNumBars;
+        const float t1   = static_cast<float>(b + 1) / cfg::kNumBars;
+        const float f0   = std::pow(10.0f, logMin + t0 * (logMax - logMin));
+        const float f1   = std::pow(10.0f, logMin + t1 * (logMax - logMin));
+        const float fc   = 0.5f * (f0 + f1);
+        const float bin0 = std::clamp(f0 / binWidthHz, 1.0f, maxValidBin);
+        const float bin1 = std::clamp(f1 / binWidthHz, 1.0f, maxValidBin);
+        if (bin1 - bin0 <= 1.0f) {
+            const float binCenter = std::clamp(fc / binWidthHz, 1.0f, maxValidBin);
+            const size_t k0 = static_cast<size_t>(std::floor(binCenter));
+            const size_t k1 = std::min(k0 + 1, cfg::kHalfBins);
+            barSpecs[b] = { true, k0, k1, binCenter - static_cast<float>(k0) };
+        } else {
+            const size_t kStart = static_cast<size_t>(std::floor(bin0));
+            const size_t kEnd   = std::min(static_cast<size_t>(std::ceil(bin1)), cfg::kHalfBins);
+            barSpecs[b] = { false, kStart, kEnd, 0.0f };
+        }
+    }
+
+    size_t lastDryWrite = 0;
+    size_t lastWetWrite = 0;
 
     // Layout regions
     constexpr float kMarginX  = 24.0f;
@@ -1114,15 +1563,21 @@ int main() {
         const float dt = GetFrameTime();
 
         // 1. Controls
+        auto KeyStep = [](int k) { return IsKeyPressed(k) || IsKeyPressedRepeat(k); };
         const float step = std::pow(10.0f, cfg::kTrimStepDb / 20.0f);
-        if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP))   engine->SetTrim(engine->Trim() * step);
-        if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) engine->SetTrim(engine->Trim() / step);
+        if (KeyStep(KEY_UP))         engine->SetTrim(engine->Trim() * step);
+        if (KeyStep(KEY_DOWN))       engine->SetTrim(engine->Trim() / step);
         if (IsKeyPressed(KEY_R))     engine->SetTrim(1.0f);
         if (IsKeyPressed(KEY_G))     engine->ToggleGate();
         if (IsKeyPressed(KEY_C))     engine->ToggleCab();
         if (IsKeyPressed(KEY_I))     engine->CycleInput();
         if (IsKeyPressed(KEY_SPACE)) engine->ToggleMute();
         if (IsKeyPressed(KEY_E))     engine->ToggleDriverMode();
+        if (IsKeyPressed(KEY_O))     engine->ToggleOverdrive();
+        if (KeyStep(KEY_ONE))        engine->SetDrive(engine->Drive() - cfg::kDriveStep);
+        if (KeyStep(KEY_TWO))        engine->SetDrive(engine->Drive() + cfg::kDriveStep);
+        if (KeyStep(KEY_THREE))      engine->SetBlend(engine->Blend() - cfg::kBlendStep);
+        if (KeyStep(KEY_FOUR))       engine->SetBlend(engine->Blend() + cfg::kBlendStep);
 
         // 2. Telemetry
         UpdatePeakMeter(inMeterDb,  engine->ConsumeInputPeak(),  dt);
@@ -1130,9 +1585,11 @@ int main() {
         limitLedTime = engine->ConsumeLimitEvent() ? cfg::kLimitLedHoldSec
                                                    : std::max(0.0f, limitLedTime - dt);
 
-        // 3. DRY tap -> tuner (keep last reading if the producer lapped us)
+        // 3. DRY tap -> tuner (only run FFT when new audio samples have been written)
         TunerReading tuner = lastTuner;
-        if (engine->DryTap().Snapshot(drySamples)) {
+        const size_t curDryWrite = engine->DryTap().TotalWritten();
+        if (curDryWrite != lastDryWrite && engine->DryTap().Snapshot(drySamples)) {
+            lastDryWrite = curDryWrite;
             ComputeMagnitudes(drySamples, hannWindow, fftBuffer, dryMagnitudes);
             tuner = DetectBassPitch(dryMagnitudes, binWidthHz);
         }
@@ -1150,39 +1607,21 @@ int main() {
             lastMidiNote = -1;
         }
 
-        // 4. WET tap -> scope + spectrum (a torn frame is visual-only and self-heals)
-        engine->WetTap().Snapshot(wetSamples);
-        ComputeMagnitudes(wetSamples, hannWindow, fftBuffer, wetMagnitudes);
-
-        const float logMin      = std::log10(cfg::kMinFreq);
-        const float logMax      = std::log10(cfg::kMaxFreq);
-        const float maxValidBin = std::min(static_cast<float>(cfg::kHalfBins),
-                                           cfg::kMaxFreq / binWidthHz);
+        // 4. WET tap -> scope + spectrum (gate FFT on new audio blocks)
+        const size_t curWetWrite = engine->WetTap().TotalWritten();
+        if (curWetWrite != lastWetWrite) {
+            lastWetWrite = curWetWrite;
+            engine->WetTap().Snapshot(wetSamples);
+            ComputeMagnitudes(wetSamples, hannWindow, fftBuffer, wetMagnitudes);
+        }
 
         for (int b = 0; b < cfg::kNumBars; ++b) {
-            const float t0 = static_cast<float>(b) / cfg::kNumBars;
-            const float t1 = static_cast<float>(b + 1) / cfg::kNumBars;
-            const float f0 = std::pow(10.0f, logMin + t0 * (logMax - logMin));
-            const float f1 = std::pow(10.0f, logMin + t1 * (logMax - logMin));
-            const float fc = 0.5f * (f0 + f1);
-
-            const float bin0 = std::clamp(f0 / binWidthHz, 1.0f, maxValidBin);
-            const float bin1 = std::clamp(f1 / binWidthHz, 1.0f, maxValidBin);
-
+            const BarBinSpec& spec = barSpecs[b];
             float bandMag = 0.0f;
-            if (bin1 - bin0 <= 1.0f) {
-                // Sub-bin resolution in the bass: interpolate neighbouring bins.
-                const float binCenter = std::clamp(fc / binWidthHz, 1.0f, maxValidBin);
-                const size_t k0 = static_cast<size_t>(std::floor(binCenter));
-                const size_t k1 = std::min(k0 + 1, cfg::kHalfBins);
-                const float frac = binCenter - static_cast<float>(k0);
-                bandMag = Lerp(wetMagnitudes[k0], wetMagnitudes[k1], frac);
+            if (spec.subBin) {
+                bandMag = Lerp(wetMagnitudes[spec.k0], wetMagnitudes[spec.k1], spec.frac);
             } else {
-                // Multi-bin bands: take the peak so narrow harmonics stay sharp.
-                const size_t kStart = static_cast<size_t>(std::floor(bin0));
-                const size_t kEnd   = std::min(static_cast<size_t>(std::ceil(bin1)),
-                                               cfg::kHalfBins);
-                for (size_t k = kStart; k <= kEnd; ++k) {
+                for (size_t k = spec.k0; k <= spec.k1; ++k) {
                     bandMag = std::max(bandMag, wetMagnitudes[k]);
                 }
             }
@@ -1285,6 +1724,10 @@ int main() {
             DrawLine(peakX, static_cast<int>(kSpecTop), peakX, static_cast<int>(kSpecBot),
                      Fade(inTune ? cfg::kTuneGreen : cfg::kTuneOrange, 0.6f));
         }
+
+        DrawText("[P] Preset  [O] Overdrive  [1/2] Drive  [3/4] Blend  [5/6] Bass  "
+                 "[7/8] Mid  [9/0] Treble  [G] Gate  [C] Cab  [E] Driver  [Space] Mute",
+                 static_cast<int>(kMarginX), 702, 12, DARKGRAY);
 
         EndDrawing();
     }
