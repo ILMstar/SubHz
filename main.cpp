@@ -103,7 +103,8 @@ constexpr float     kTrimMax        = 100.0f;          // +40 dB
 constexpr float     kTrimStepDb     = 1.0f;
 
 // DSP chain
-constexpr float     kDcBlockHz          = 28.0f;
+constexpr float     kDcBlockHz          = 10.0f;       // < 0.45 dB loss at B0 (30.87 Hz)
+constexpr float     kOdDcBlockHz        = 15.0f;       // post-overdrive DC blocker
 constexpr float     kCabLpfHz           = 4500.0f;
 constexpr float     kCabToggleMs        = 10.0f;       // click-free cab/bypass crossfade
 constexpr float     kGateOpenDb         = -54.0f;      // hysteresis: open above ...
@@ -806,9 +807,9 @@ public:
                     const float r = input[frame * cfg::kChannelsIn + 1];
                     x = (select == 0) ? l : (select == 1) ? r : 0.5f * (l + r);
                 }
-                x *= trim;
                 if (!std::isfinite(x)) x = 0.0f;
-                inPeak = std::max(inPeak, std::fabs(x));
+                inPeak = std::max(inPeak, std::fabs(x)); // pre-trim ADC peak
+                x *= trim;
 
                 for (const auto& node : dspChain_) x = node->process(x, sr);
 
