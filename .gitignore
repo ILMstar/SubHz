@@ -6,6 +6,7 @@
 *.pdb
 *.ilk
 *.log
+*.cfg
 
 # Shared libraries / DLLs
 *.dll
@@ -16,4 +17,3 @@
 .idea/
 .DS_Store
 Thumbs.db
-

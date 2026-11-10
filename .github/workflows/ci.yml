@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-raylib
+      - name: Compile SubHz
+        run: |
+          g++ -std=c++17 -O3 -Wall -Wextra -Werror main.cpp -o SubHz.exe \
+            -static-libgcc -static-libstdc++ \
+            -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic \
+            -lraylib -lopengl32 -lgdi32 -lwinmm
+      - name: Compile and run offline test suite
+        run: |
+          g++ -std=c++17 -O3 -Wall -Wextra -Werror tests.cpp -o tests.exe \
+            -static-libgcc -static-libstdc++ \
+            -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic \
+            -lwinmm
+          ./tests.exe
