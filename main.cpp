@@ -146,7 +146,8 @@ constexpr float     kSmoothing      = 0.15f;           // Lerp factor per frame
 // Chromatic tuner (30 - 1200 Hz covers low B0 bass through full vocal range)
 constexpr float     kTunerMinHz     = 30.0f;           // Covers low B0 (30.87 Hz)
 constexpr float     kTunerMaxHz     = 1200.0f;         // Covers bass + voice up to D6
-constexpr float     kTunerGateMag   = 0.002f;          // ~ -54.0 dBFS
+constexpr float     kTunerDefaultGateDb = -44.0f;
+constexpr float     kTunerGateMag   = 0.00630957f;     // -44.0 dBFS (rejects -46 dBFS mains hum)
 constexpr float     kInTuneCents    = 5.0f;
 constexpr float     kTunerLerp      = 0.20f;
 
@@ -1153,7 +1154,10 @@ static TunerReading DetectBassPitch(const std::vector<float>& magnitudes,
     // Subharmonic lock: in voice (vowel formants) and neck/bridge bass pickups, 2*f0 or
     // 3*f0 often exceeds f0. If a lower local peak sits at bestFreq / h (h = 2..4) with
     // >= 25% (-12 dB) of bestMag, lock onto the true fundamental f0 instead of jumping octaves.
-    const float subMinMag = std::max(cfg::kTunerGateMag, 0.25f * bestMag);
+    // Subharmonic lock down to -20 dB (0.10 * bestMag) + low-level 50/60 Hz mains hum guard
+    const bool nearMains = (std::fabs(bestFreq - 50.0) <= 0.65) || (std::fabs(bestFreq - 60.0) <= 0.65);
+    if (nearMains && bestMag < DbToLin(-32.0f)) return out;
+    const float subMinMag = std::max(0.0005f, 0.09f * bestMag);
     for (size_t k = minBin; k <= maxBin; ++k) {
         const float m = magnitudes[k];
         if (m < subMinMag) continue;
@@ -1171,7 +1175,7 @@ static TunerReading DetectBassPitch(const std::vector<float>& magnitudes,
             }
         }
         if (isFundamental) {
-            bestFreq = candFreq;
+            bestFreq = bestFreq / static_cast<double>(h);
             break;
         }
     }
