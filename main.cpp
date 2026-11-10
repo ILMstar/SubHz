@@ -111,7 +111,8 @@ constexpr float     kGateCloseDb        = -62.0f;      // ... close below (8 dB 
 constexpr float     kGateAttackMs       = 1.0f;
 constexpr float     kGateReleaseMs      = 80.0f;
 constexpr float     kCompAttackMs       = 10.0f;       // optical-style feed-forward attack
-constexpr float     kCompReleaseMs      = 120.0f;      // smooth optical release
+constexpr float     kCompReleaseMs      = 120.0f;      // single-stage 120 ms release to 37%
+constexpr float     kParamSmoothMs      = 15.0f;       // click-free preset parameter smoothing
 constexpr float     kCompRatio          = 4.0f;        // 4:1 bass compression
 constexpr float     kCompDefaultThreshDb = -18.0f;
 constexpr float     kCompDefaultMakeupDb = 1.5f;
@@ -372,16 +373,13 @@ public:
             makeupLin_      = DbToLin(makeupDb);
         }
 
-        const float level    = std::fabs(sample);
-        const float envCoeff = level > envelope_ ? peakAttack_ : releaseCoeff_;
-        envelope_ += (level - envelope_) * envCoeff;
-        if (!std::isfinite(envelope_)) envelope_ = 0.0f;
-
+        // Single-stage dB ballistic release (avoids 245 ms double-smoother lag)
+        const float level = std::isfinite(sample) ? std::fabs(sample) : 0.0f;
+        envelope_ = level > envelope_ ? level : (envelope_ + (level - envelope_) * OnePoleCoeff(8.0f, sampleRate));
         float targetGrDb = 0.0f;
         if (envelope_ > thresholdLin_ && thresholdLin_ > 1e-6f) {
-            constexpr float kSlope = 1.0f - (1.0f / cfg::kCompRatio);   // 0.75 for 4:1
-            const float overDb = 20.0f * std::log10(envelope_ / thresholdLin_);
-            targetGrDb = kSlope * overDb;
+            constexpr float kSlope = 1.0f - (1.0f / cfg::kCompRatio);
+            targetGrDb = kSlope * 20.0f * std::log10(envelope_ / thresholdLin_);
         }
 
         const float grCoeff = targetGrDb > grMeterDb_ ? attackCoeff_ : releaseCoeff_;
