@@ -1573,11 +1573,18 @@ int main() {
         if (IsKeyPressed(KEY_I))     engine->CycleInput();
         if (IsKeyPressed(KEY_SPACE)) engine->ToggleMute();
         if (IsKeyPressed(KEY_E))     engine->ToggleDriverMode();
+        if (IsKeyPressed(KEY_P))     engine->CyclePreset();
         if (IsKeyPressed(KEY_O))     engine->ToggleOverdrive();
         if (KeyStep(KEY_ONE))        engine->SetDrive(engine->Drive() - cfg::kDriveStep);
         if (KeyStep(KEY_TWO))        engine->SetDrive(engine->Drive() + cfg::kDriveStep);
         if (KeyStep(KEY_THREE))      engine->SetBlend(engine->Blend() - cfg::kBlendStep);
         if (KeyStep(KEY_FOUR))       engine->SetBlend(engine->Blend() + cfg::kBlendStep);
+        if (KeyStep(KEY_FIVE))       engine->SetBassDb(engine->BassDb() - cfg::kEqStepDb);
+        if (KeyStep(KEY_SIX))        engine->SetBassDb(engine->BassDb() + cfg::kEqStepDb);
+        if (KeyStep(KEY_SEVEN))      engine->SetMidDb(engine->MidDb() - cfg::kEqStepDb);
+        if (KeyStep(KEY_EIGHT))      engine->SetMidDb(engine->MidDb() + cfg::kEqStepDb);
+        if (KeyStep(KEY_NINE))       engine->SetTrebleDb(engine->TrebleDb() - cfg::kEqStepDb);
+        if (KeyStep(KEY_ZERO))       engine->SetTrebleDb(engine->TrebleDb() + cfg::kEqStepDb);
 
         // 2. Telemetry
         UpdatePeakMeter(inMeterDb,  engine->ConsumeInputPeak(),  dt);
