@@ -741,30 +741,229 @@ static void DrawSignalChainStage(AudioEngine& engine, int x, int y, int w, int h
     }
 }
 
+// -------------------------------------------------------------------------------------
+//  4. Right Sidebar (Chromatic Tuner + Preset Collection Browser + Audio Endpoints)
+// -------------------------------------------------------------------------------------
 static void DrawRightSidebar(AudioEngine& engine, TunerTracker& tunerTracker,
                              const TunerReading& tuner, float smoothedCents,
                              float smoothedHz, int x, int y, int w, int h) {
-    (void)engine;
-    (void)tunerTracker;
     DrawRectangle(x, y, w, h, ui_col::kSidebarBg);
     DrawLine(x, y, x, y + h, ui_col::kGrid);
-    const char* noteText = tuner.active ? TextFormat("%s%d (%.1f Hz, %+.1f ct)",
-                                                     tuner.noteName, tuner.octave, smoothedHz, smoothedCents)
-                                        : "TUNER: PLAY A NOTE";
-    DrawText(noteText, x + 16, y + 20, 14, tuner.active ? ui_col::kTuneGreen : GRAY);
+
+    const int pad   = 10;
+    const int cardX = x + pad;
+    const int cardW = w - 2 * pad;
+    int       curY  = y + pad;
+
+    // ---- Card 1: Precision Chromatic Tuner -----------------------------------------
+    constexpr int kTunerH = 148;
+    Color statusCol = DARKGRAY;
+    if (tuner.active) {
+        const float absCents = std::fabs(smoothedCents);
+        if (absCents <= cfg::kInTuneCents) {
+            statusCol = ui_col::kTuneGreen;
+        } else {
+            const float sev = std::clamp((absCents - cfg::kInTuneCents) / 20.0f, 0.0f, 1.0f);
+            statusCol = BlendColor(ui_col::kTuneOrange, ui_col::kTuneRed, sev);
+        }
+    }
+
+    DrawRectangle(cardX, curY, cardW, kTunerH, ui_col::kPanelBg);
+    DrawRectangleLines(cardX, curY, cardW, kTunerH,
+                       tuner.active ? Fade(statusCol, 0.85f) : ui_col::kGrid);
+    DrawText("CHROMATIC TUNER (YIN+FFT)", cardX + 10, curY + 8, 11, ui_col::kBrassHi);
+
+    const char* noteText = tuner.active ? TextFormat("%s%d", tuner.noteName, tuner.octave) : "--";
+    constexpr int kNoteFont = 40;
+    const int noteW = MeasureText(noteText, kNoteFont);
+    DrawText(noteText, cardX + (cardW - noteW) / 2, curY + 26, kNoteFont,
+             tuner.active ? statusCol : GRAY);
+
+    if (tuner.active) {
+        DrawText(TextFormat("%.1f Hz", smoothedHz), cardX + 12, curY + 34, 14, LIGHTGRAY);
+        const bool inTune = std::fabs(smoothedCents) <= cfg::kInTuneCents;
+        const char* ctTxt = inTune ? TextFormat("%+.1f ct OK", smoothedCents)
+                                   : TextFormat("%+.1f ct", smoothedCents);
+        DrawText(ctTxt, cardX + cardW - MeasureText(ctTxt, 14) - 12, curY + 34, 14, statusCol);
+    } else {
+        DrawText("30-1200 Hz", cardX + 12, curY + 36, 12, DARKGRAY);
+        const char* idle = "PLAY A NOTE";
+        DrawText(idle, cardX + cardW - MeasureText(idle, 12) - 12, curY + 36, 12, DARKGRAY);
+    }
+
+    // Needle gauge
+    const int   gaugeW    = cardW - 36;
+    const int   gaugeX    = cardX + 18;
+    const int   gaugeY    = curY + 78;
+    constexpr int kGaugeH = 14;
+    const int   centerX   = gaugeX + gaugeW / 2;
+    const float pxPerCent = gaugeW / 100.0f;
+
+    DrawRectangle(gaugeX, gaugeY, gaugeW, kGaugeH, Color{ 0x0E, 0x0E, 0x12, 0xFF });
+    const int inTuneHalfW = static_cast<int>(std::round(cfg::kInTuneCents * pxPerCent));
+    DrawRectangle(centerX - inTuneHalfW, gaugeY, inTuneHalfW * 2, kGaugeH,
+                  Fade(ui_col::kTuneGreen, tuner.active ? 0.28f : 0.10f));
+    DrawRectangleLines(gaugeX, gaugeY, gaugeW, kGaugeH, ui_col::kGrid);
+
+    for (int ct : { -50, -25, 0, 25, 50 }) {
+        const int tx = centerX + static_cast<int>(std::round(ct * pxPerCent));
+        DrawLine(tx, gaugeY - 3, tx, gaugeY + kGaugeH + 3, (ct == 0) ? RAYWHITE : GRAY);
+    }
+    if (tuner.active) {
+        const float clamped = std::clamp(smoothedCents, -50.0f, 50.0f);
+        const int   needleX = centerX + static_cast<int>(std::round(clamped * pxPerCent));
+        const int   barLeft = std::min(centerX, needleX);
+        const int   barW    = std::abs(needleX - centerX);
+        if (barW > 0) DrawRectangle(barLeft, gaugeY + 3, barW, kGaugeH - 6, Fade(statusCol, 0.55f));
+        DrawRectangle(needleX - 2, gaugeY - 4, 5, kGaugeH + 8, statusCol);
+    }
+
+    // Tuner gate buttons
+    DrawText(TextFormat("Tuner Gate: %.0f dB", tunerTracker.GateDb()),
+             cardX + 12, curY + 118, 12, GRAY);
+    if (DrawButton(cardX + cardW - 68, curY + 114, 26, 22, "[-]", 11,
+                   LIGHTGRAY, ui_col::kSidebarBg, ui_col::kGrid)) {
+        tunerTracker.SetGateDb(tunerTracker.GateDb() - cfg::kTunerGateStepDb);
+    }
+    if (DrawButton(cardX + cardW - 38, curY + 114, 26, 22, "[+]", 11,
+                   LIGHTGRAY, ui_col::kSidebarBg, ui_col::kGrid)) {
+        tunerTracker.SetGateDb(tunerTracker.GateDb() + cfg::kTunerGateStepDb);
+    }
+
+    curY += kTunerH + 10;
+
+    // ---- Card 2: Tone Preset Browser (AmpliTube Collection Style) -------------------
+    constexpr int kPresetsH = 198;
+    DrawRectangle(cardX, curY, cardW, kPresetsH, ui_col::kPanelBg);
+    DrawRectangleLines(cardX, curY, cardW, kPresetsH, ui_col::kGrid);
+    DrawText("RIG PRESETS [P]", cardX + 10, curY + 8, 11, ui_col::kBrassHi);
+
+    for (int i = 0; i < static_cast<int>(kPresets.size()); ++i) {
+        const bool selected = (engine.PresetIndex() == i);
+        const int  py       = curY + 28 + i * 32;
+        if (DrawButton(cardX + 8, py, cardW - 16, 28, kPresets[i].name, 12,
+                       selected ? ui_col::kBrassHi : LIGHTGRAY,
+                       Color{ 0x14, 0x14, 0x18, 0xFF },
+                       selected ? ui_col::kBrassHi : ui_col::kGrid, selected)) {
+            engine.ApplyPreset(i);
+        }
+    }
+
+    const int jsonBtnY = curY + 28 + 4 * 32 + 4;
+    const int halfW    = (cardW - 22) / 2;
+    if (DrawButton(cardX + 8, jsonBtnY, halfW, 26, "EXPORT JSON [S]", 10,
+                   RAYWHITE, Color{ 0x14, 0x24, 0x22, 0xFF }, ui_col::kNeon)) {
+        engine.SaveRigPresetJson(cfg::kPresetJsonFile);
+    }
+    if (DrawButton(cardX + 14 + halfW, jsonBtnY, halfW, 26, "IMPORT JSON [L]", 10,
+                   RAYWHITE, Color{ 0x14, 0x1E, 0x28, 0xFF }, ui_col::kNeonLow)) {
+        engine.LoadRigPresetJson(cfg::kPresetJsonFile);
+    }
+
+    curY += kPresetsH + 10;
+
+    // ---- Card 3: Audio Endpoints & Hardware Routing --------------------------------
+    const int ioH = std::max(110, y + h - curY - pad);
+    DrawRectangle(cardX, curY, cardW, ioH, ui_col::kPanelBg);
+    DrawRectangleLines(cardX, curY, cardW, ioH, ui_col::kGrid);
+    DrawText("AUDIO I/O ENDPOINTS", cardX + 10, curY + 8, 11, ui_col::kBrassHi);
+
+    if (DrawButton(cardX + 8, curY + 28, cardW - 16, 26,
+                   TextFormat("IN [D]: %.28s", engine.CaptureName()), 11,
+                   LIGHTGRAY, Color{ 0x14, 0x14, 0x18, 0xFF }, ui_col::kNeon)) {
+        engine.CycleCaptureDevice();
+    }
+    if (DrawButton(cardX + 8, curY + 58, cardW - 16, 26,
+                   TextFormat("OUT [F2]: %.26s", engine.PlaybackName()), 11,
+                   LIGHTGRAY, Color{ 0x14, 0x14, 0x18, 0xFF }, ui_col::kNeonLow)) {
+        engine.CyclePlaybackDevice();
+    }
+
+    const LatencyInfo lat = engine.Latency();
+    DrawText(TextFormat("Buffer: %ux%u @ %.1fkHz  |  RT ~%.1f ms",
+                        lat.periodFrames, lat.periods, lat.sampleRate / 1000.0f, lat.roundTripMs),
+             cardX + 10, curY + 90, 11, GRAY);
+}
+
+// -------------------------------------------------------------------------------------
+//  5. Bottom Transport & Telemetry Bar (Input Meter | Comp GR & Gate | Output Meter)
+// -------------------------------------------------------------------------------------
+static void DrawSegmentedMeter(int x, int y, int w, int h, const char* label, float db,
+                               bool clipOrLimit, const char* ledLabel) {
+    DrawText(label, x, y - 14, 11, LIGHTGRAY);
+    const char* valTxt = (db <= cfg::kMeterFloorDb + 0.05f) ? "-inf dB" : TextFormat("%.1f dB", db);
+    DrawText(valTxt, x + w - MeasureText(valTxt, 11) - 52, y - 14, 11, GRAY);
+
+    const int barW = w - 50;
+    DrawRectangle(x, y, barW, h, Color{ 0x0C, 0x0C, 0x0F, 0xFF });
+
+    auto dbToX = [&](float d) {
+        const float t = (d - cfg::kMeterFloorDb) / (0.0f - cfg::kMeterFloorDb);
+        return x + static_cast<int>(std::round(std::clamp(t, 0.0f, 1.0f) * barW));
+    };
+
+    struct Zone { float lo, hi; Color c; };
+    const Zone zones[] = {
+        { cfg::kMeterFloorDb, -12.0f, ui_col::kTuneGreen },
+        { -12.0f, -3.0f,              ui_col::kTuneOrange },
+        { -3.0f,   0.0f,              ui_col::kTuneRed }
+    };
+    for (const auto& z : zones) {
+        if (db <= z.lo) break;
+        const int x0 = dbToX(z.lo);
+        const int x1 = dbToX(std::min(db, z.hi));
+        if (x1 > x0) DrawRectangle(x0, y + 1, x1 - x0, h - 2, z.c);
+    }
+    for (float tick : { -48.0f, -36.0f, -24.0f, -12.0f, -6.0f, -3.0f }) {
+        const int tx = dbToX(tick);
+        DrawLine(tx, y, tx, y + h, ui_col::kTopBarBg);
+    }
+    DrawRectangleLines(x, y, barW, h, ui_col::kGrid);
+
+    // Clip / Limit LED pill
+    const int ledX = x + barW + 6;
+    DrawRectangle(ledX, y - 1, 44, h + 2,
+                  clipOrLimit ? ui_col::kTuneRed : Color{ 0x26, 0x12, 0x12, 0xFF });
+    DrawRectangleLines(ledX, y - 1, 44, h + 2, ui_col::kGrid);
+    const int lw = MeasureText(ledLabel, 10);
+    DrawText(ledLabel, ledX + (44 - lw) / 2, y + (h - 10) / 2, 10,
+             clipOrLimit ? RAYWHITE : DARKGRAY);
 }
 
 static void DrawBottomMeterBar(const AudioEngine& engine, int screenW, int screenH,
                                float inDb, float outDb, bool limitLed, bool adcClipLed) {
-    (void)limitLed;
-    (void)adcClipLed;
     constexpr int kBarH = 46;
     const int     y     = screenH - kBarH;
+
     DrawRectangle(0, y, screenW, kBarH, ui_col::kTopBarBg);
     DrawLine(0, y, screenW, y, ui_col::kGrid);
-    DrawText(TextFormat("IN: %.1f dB   |   COMP GR: -%.1f dB   |   OUT: %.1f dB",
-                        inDb, engine.CompGainReductionDb(), outDb),
-             20, y + 16, 14, LIGHTGRAY);
+
+    const int meterW = std::clamp(screenW / 4, 240, 340);
+    DrawSegmentedMeter(14, y + 22, meterW, 14, "INPUT (PRE-TRIM ADC)", inDb, adcClipLed, "CLIP");
+    DrawSegmentedMeter(screenW - meterW - 14, y + 22, meterW, 14, "MASTER OUTPUT", outDb, limitLed, "LIMIT");
+
+    // Center section: Compressor Gain Reduction + Gate LED
+    const int centerW = 280;
+    const int centerX = (screenW - centerW) / 2;
+    const float grDb  = std::clamp(engine.CompGainReductionDb(), 0.0f, 18.0f);
+    DrawText(TextFormat("COMP GR: -%.1f dB", grDb), centerX, y + 8, 11,
+             grDb > 0.2f ? ui_col::kTuneOrange : GRAY);
+
+    const int grBarW = 140;
+    const int grFill = static_cast<int>(std::round((grDb / 18.0f) * grBarW));
+    DrawRectangle(centerX, y + 22, grBarW, 14, Color{ 0x0C, 0x0C, 0x0F, 0xFF });
+    if (grFill > 0) DrawRectangle(centerX + 1, y + 23, grFill, 12, ui_col::kTuneOrange);
+    DrawRectangleLines(centerX, y + 22, grBarW, 14, ui_col::kGrid);
+
+    const bool gateOn   = engine.GateEnabled();
+    const bool gateOpen = engine.GateOpen();
+    const int  gBoxX    = centerX + grBarW + 12;
+    DrawRectangle(gBoxX, y + 21, 118, 16,
+                  !gateOn ? Color{ 0x1A, 0x1A, 0x1E, 0xFF }
+                          : (gateOpen ? Color{ 0x12, 0x38, 0x20, 0xFF } : Color{ 0x28, 0x16, 0x16, 0xFF }));
+    DrawRectangleLines(gBoxX, y + 21, 118, 16, gateOn && gateOpen ? ui_col::kTuneGreen : ui_col::kGrid);
+    const char* gateTxt = !gateOn ? "GATE: BYPASS [G]" : (gateOpen ? "GATE: OPEN [G]" : "GATE: CLOSED [G]");
+    DrawText(gateTxt, gBoxX + 10, y + 24, 10, !gateOn ? GRAY : (gateOpen ? ui_col::kTuneGreen : LIGHTGRAY));
 }
 
 // -------------------------------------------------------------------------------------
