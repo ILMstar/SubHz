@@ -2,7 +2,7 @@
 
 Real-time full-duplex bass & vocal DSP rig, dual-band spectrum visualizer, triggered oscilloscope, and chromatic tuner written in **C++17** using **Raylib** and **miniaudio** (Windows / WASAPI). Licensed under the [MIT License](LICENSE).
 
-![SubHz Application Screenshot](assets/subbhz.png)
+![SubHz Application Screenshot](assets/subhz.png)
 
 ---
 
