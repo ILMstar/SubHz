@@ -315,6 +315,19 @@ public:
         presetModified_ = true;
     }
     float Blend() const noexcept { return overdrive_->Blend(); }
+    void  SetOverdriveOversample(int factor) noexcept {
+        overdrive_->SetOversample(factor);
+    }
+    int   OverdriveOversample() const noexcept { return overdrive_->Oversample(); }
+    void  CycleOverdriveOversample() noexcept {
+        const int cur  = overdrive_->Oversample();
+        const int next = (cur == 1) ? 2 : (cur == 2) ? 4 : 1;
+        overdrive_->SetOversample(next);
+        char msg[96]{};
+        std::snprintf(msg, sizeof(msg), "OVERDRIVE OVERSAMPLING [X]: %dx (%.0f kHz)",
+                      next, sampleRate_ * static_cast<float>(next) * 0.001f);
+        SetNotice(msg, false);
+    }
 
     void  SetBassDb(float db) noexcept {
         eq_->SetBassDb(db);
@@ -367,6 +380,7 @@ public:
         overdrive_->SetBypass(s.odBypass);
         overdrive_->SetDrive(s.odDrive);
         overdrive_->SetBlend(s.odBlend);
+        overdrive_->SetOversample(s.odOversample);
         eq_->SetBassDb(s.bassDb);
         eq_->SetMidDb(s.midDb);
         eq_->SetTrebleDb(s.trebleDb);
@@ -386,9 +400,10 @@ public:
         s.gateEnabled = GateEnabled();
         s.cabEnabled  = CabEnabled();
         s.odBypass    = !OverdriveEnabled();
-        s.odDrive     = Drive();
-        s.odBlend     = Blend();
-        s.bassDb      = BassDb();
+        s.odDrive      = Drive();
+        s.odBlend      = Blend();
+        s.odOversample = OverdriveOversample();
+        s.bassDb       = BassDb();
         s.midDb       = MidDb();
         s.trebleDb    = TrebleDb();
         s.exclusive   = Exclusive();

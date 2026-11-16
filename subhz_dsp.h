@@ -194,17 +194,20 @@ private:
 
 // -------------------------------------------------------------------------------------
 //  BassOverdriveNode: 1st-order complementary crossover at 150 Hz splits the signal into
-//  a clean tight lowBand (<150 Hz) and a highBand (>150 Hz) driven through asymmetric
-//  tube-style soft clipping: tanh(highBand * drive + 0.1) - tanh(0.1) with automatic
-//  gain compensation, followed by a 15 Hz post-clipping DC blocker so asymmetric
-//  rectification never injects DC offset into downstream EQ/Cab/Limiter stages.
+//  a clean tight lowBand (<150 Hz) and a highBand (>150 Hz) driven through 2x/4x
+//  oversampled (up to 192 kHz) asymmetric tube-style soft clipping:
+//  tanh(u * drive + 0.1) - tanh(0.1) with automatic gain compensation, 4th-order
+//  Butterworth anti-aliasing low-pass filter before decimation, and a 15 Hz post-clip
+//  DC blocker so asymmetric rectification never injects DC offset downstream.
 // -------------------------------------------------------------------------------------
 class BassOverdriveNode final : public IDspNode {
 public:
     float process(float sample, float sampleRate) noexcept override {
         const float targetDrive = drive_.load(std::memory_order_relaxed);
-        if (sampleRate != cachedRate_) {
+        const int   osFactor    = oversample_.load(std::memory_order_relaxed);
+        if (sampleRate != cachedRate_ || osFactor != cachedOs_) {
             cachedRate_  = sampleRate;
+            cachedOs_    = osFactor;
             lpCoeff_     = static_cast<float>(
                 1.0 - std::exp(-2.0 * cfg::kPi * cfg::kOverdriveCrossHz / sampleRate));
             dcR_         = std::exp(-2.0 * cfg::kPi * cfg::kOdDcBlockHz / sampleRate);
@@ -212,6 +215,7 @@ public:
             paramCoeff_  = OnePoleCoeff(cfg::kParamSmoothMs, sampleRate);
             smoothDrive_ = targetDrive;
             driveComp_   = 1.0f / std::pow(std::max(smoothDrive_, 1.0f), 0.55f);
+            UpdateAntiAliasFilter(sampleRate, osFactor);
         }
 
         if (smoothDrive_ != targetDrive) {
@@ -231,7 +235,24 @@ public:
         // Asymmetric tube-style saturation on highBand (>150 Hz) + auto gain compensation
         constexpr float kBias     = 0.1f;
         const float     kBiasTanh = std::tanh(kBias);
-        const float     rawHi     = (std::tanh(highBand * smoothDrive_ + kBias) - kBiasTanh) * driveComp_;
+        float           rawHi     = 0.0f;
+
+        if (osFactor <= 1) {
+            rawHi = (std::tanh(highBand * smoothDrive_ + kBias) - kBiasTanh) * driveComp_;
+        } else {
+            // Upsample to 96 kHz (2x) or 192 kHz (4x), saturate, anti-alias LPF, decimate
+            const float prev = prevHigh_;
+            const float step = (highBand - prev) / static_cast<float>(osFactor);
+            double decimated = 0.0;
+            for (int k = 1; k <= osFactor; ++k) {
+                const float  u = prev + step * static_cast<float>(k);
+                const double s = static_cast<double>(
+                    (std::tanh(u * smoothDrive_ + kBias) - kBiasTanh) * driveComp_);
+                decimated = RunAntiAlias(s);
+            }
+            rawHi = static_cast<float>(decimated);
+        }
+        prevHigh_ = highBand;
 
         // Post-saturation 15 Hz DC blocker removes rectified DC offset from asymmetric tanh
         const double dcClean = static_cast<double>(rawHi) - dcX1_ + dcR_ * dcY1_;
@@ -257,20 +278,74 @@ public:
         blend_.store(std::clamp(b, cfg::kBlendMin, cfg::kBlendMax), std::memory_order_relaxed);
     }
     float Blend() const noexcept { return blend_.load(std::memory_order_relaxed); }
+    void  SetOversample(int factor) noexcept {
+        oversample_.store(ClampOversample(factor), std::memory_order_relaxed);
+    }
+    int   Oversample() const noexcept { return oversample_.load(std::memory_order_relaxed); }
 
 private:
+    struct AaBiquad {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+        double z1 = 0.0, z2 = 0.0;
+    };
+
+    static void SetupLowPass(AaBiquad& bq, double fc, double q, double osRate) noexcept {
+        const double w0    = 2.0 * cfg::kPi * fc / osRate;
+        const double cosw  = std::cos(w0);
+        const double alpha = std::sin(w0) / (2.0 * q);
+        const double a0    = 1.0 + alpha;
+        bq.b0 = (1.0 - cosw) * 0.5 / a0;
+        bq.b1 = (1.0 - cosw) / a0;
+        bq.b2 = bq.b0;
+        bq.a1 = -2.0 * cosw / a0;
+        bq.a2 = (1.0 - alpha) / a0;
+    }
+
+    void UpdateAntiAliasFilter(float sampleRate, int osFactor) noexcept {
+        if (osFactor <= 1) return;
+        const double osRate = static_cast<double>(sampleRate) * static_cast<double>(osFactor);
+        const double fc     = 0.40 * static_cast<double>(sampleRate); // 19.2 kHz @ 48 kHz base
+        // 4th-order Butterworth cascade (Q1 = 0.54119610, Q2 = 1.30656296)
+        SetupLowPass(aa_[0], fc, 0.541196100146197, osRate);
+        SetupLowPass(aa_[1], fc, 1.306562964876376, osRate);
+        for (AaBiquad& bq : aa_) {
+            bq.z1 = 0.0;
+            bq.z2 = 0.0;
+        }
+    }
+
+    double RunAntiAlias(double x) noexcept {
+        for (AaBiquad& bq : aa_) {
+            const double y = bq.b0 * x + bq.z1;
+            bq.z1 = bq.b1 * x - bq.a1 * y + bq.z2;
+            bq.z2 = bq.b2 * x - bq.a2 * y;
+            if (!std::isfinite(y) || !std::isfinite(bq.z1) || !std::isfinite(bq.z2)) {
+                bq.z1 = 0.0;
+                bq.z2 = 0.0;
+                x     = 0.0;
+            } else {
+                x = y;
+            }
+        }
+        return x;
+    }
+
     std::atomic<bool>  bypass_{true};
     std::atomic<float> drive_{2.0f};
     std::atomic<float> blend_{0.0f};
+    std::atomic<int>   oversample_{cfg::kOdOversampleDefault};
 
     float  cachedRate_  = 0.0f;
+    int    cachedOs_    = 0;
     float  smoothDrive_ = 2.0f;
     float  lpCoeff_     = 1.0f;
     float  mixCoeff_    = 1.0f;
     float  paramCoeff_  = 1.0f;
     float  driveComp_   = 1.0f;
     float  lowBand_     = 0.0f;
+    float  prevHigh_    = 0.0f;
     float  smoothBlend_ = 0.0f;
+    std::array<AaBiquad, 2> aa_{};
     double dcR_ = 0.0, dcX1_ = 0.0, dcY1_ = 0.0;
 };
 

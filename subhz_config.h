@@ -60,6 +60,7 @@ constexpr float  kCompRatio          = 4.0f;            // 4:1 bass compression
 constexpr float  kCompDefaultThreshDb = -18.0f;
 constexpr float  kCompDefaultMakeupDb = 1.5f;
 constexpr float  kOverdriveCrossHz   = 150.0f;          // Split-band crossover (<150 Hz clean)
+constexpr int    kOdOversampleDefault = 4;              // 4x oversampling (192 kHz @ 48 kHz)
 constexpr float  kDriveMin           = 1.0f;
 constexpr float  kDriveMax           = 25.0f;
 constexpr float  kDriveStep          = 0.5f;
@@ -109,6 +110,10 @@ constexpr float  kLimitLedHoldSec    = 0.25f;
 constexpr double kPi                 = 3.14159265358979323846;
 constexpr const char* kConfigFile    = "subhz.cfg";
 }  // namespace cfg
+
+inline int ClampOversample(int factor) noexcept {
+    return (factor >= 4) ? 4 : (factor >= 2) ? 2 : 1;
+}
 
 // -------------------------------------------------------------------------------------
 //  Small math helpers (C++17: no std::lerp)
@@ -210,6 +215,7 @@ struct AppSettings {
     bool  odBypass      = true;
     float odDrive       = 2.0f;
     float odBlend       = 0.0f;
+    int   odOversample  = cfg::kOdOversampleDefault;
     float bassDb        = 0.0f;
     float midDb         = 0.0f;
     float trebleDb      = 0.0f;
@@ -230,6 +236,7 @@ inline bool SaveSettings(const char* path, const AppSettings& s) noexcept {
     std::fprintf(fp, "odBypass=%d\n",      s.odBypass    ? 1 : 0);
     std::fprintf(fp, "odDrive=%.4f\n",     s.odDrive);
     std::fprintf(fp, "odBlend=%.4f\n",     s.odBlend);
+    std::fprintf(fp, "odOversample=%d\n",  ClampOversample(s.odOversample));
     std::fprintf(fp, "bassDb=%.4f\n",      s.bassDb);
     std::fprintf(fp, "midDb=%.4f\n",       s.midDb);
     std::fprintf(fp, "trebleDb=%.4f\n",    s.trebleDb);
@@ -255,9 +262,10 @@ inline bool LoadSettings(const char* path, AppSettings& s) noexcept {
             else if (std::strcmp(key, "gateEnabled") == 0) s.gateEnabled = (static_cast<int>(val) != 0);
             else if (std::strcmp(key, "cabEnabled") == 0)  s.cabEnabled  = (static_cast<int>(val) != 0);
             else if (std::strcmp(key, "odBypass") == 0)    s.odBypass    = (static_cast<int>(val) != 0);
-            else if (std::strcmp(key, "odDrive") == 0)     s.odDrive     = std::clamp(val, cfg::kDriveMin, cfg::kDriveMax);
-            else if (std::strcmp(key, "odBlend") == 0)     s.odBlend     = std::clamp(val, cfg::kBlendMin, cfg::kBlendMax);
-            else if (std::strcmp(key, "bassDb") == 0)      s.bassDb      = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
+            else if (std::strcmp(key, "odDrive") == 0)     s.odDrive      = std::clamp(val, cfg::kDriveMin, cfg::kDriveMax);
+            else if (std::strcmp(key, "odBlend") == 0)     s.odBlend      = std::clamp(val, cfg::kBlendMin, cfg::kBlendMax);
+            else if (std::strcmp(key, "odOversample") == 0) s.odOversample = ClampOversample(static_cast<int>(val));
+            else if (std::strcmp(key, "bassDb") == 0)      s.bassDb       = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
             else if (std::strcmp(key, "midDb") == 0)       s.midDb       = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
             else if (std::strcmp(key, "trebleDb") == 0)    s.trebleDb    = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
             else if (std::strcmp(key, "tunerGateDb") == 0) s.tunerGateDb = std::clamp(val, cfg::kTunerMinGateDb, cfg::kTunerMaxGateDb);
