@@ -251,7 +251,7 @@ static void DrawTelemetryPanel(const AudioEngine& engine, float inDb, float outD
 static void DrawSignalFlowPanel(AudioEngine& engine, int screenW, int& dragSlot) {
     const int kX = std::max(864, screenW - 416);
     constexpr int kY = 46;
-    DrawText(TextFormat("PRESET [P]: %s%s", engine.PresetName(),
+    DrawText(TextFormat("PRESET [P]: %s%s   [S] Save [L] Load", engine.PresetName(),
                         engine.PresetModified() ? " *" : ""),
              kX, kY, 14, ui_col::kNeon);
 
@@ -547,6 +547,8 @@ int main() {
         if (IsKeyPressed(KEY_P))       engine->CyclePreset();
         if (IsKeyPressed(KEY_O))       engine->ToggleOverdrive();
         if (IsKeyPressed(KEY_X))       engine->CycleOverdriveOversample();
+        if (IsKeyPressed(KEY_S))       engine->SaveRigPresetJson(cfg::kPresetJsonFile);
+        if (IsKeyPressed(KEY_L))       engine->LoadRigPresetJson(cfg::kPresetJsonFile);
         if (KeyStep(KEY_ONE))          engine->SetDrive(engine->Drive() - cfg::kDriveStep);
         if (KeyStep(KEY_TWO))          engine->SetDrive(engine->Drive() + cfg::kDriveStep);
         if (KeyStep(KEY_THREE))        engine->SetBlend(engine->Blend() - cfg::kBlendStep);
@@ -766,8 +768,8 @@ int main() {
                      Fade(inTune ? ui_col::kTuneGreen : ui_col::kTuneOrange, 0.6f));
         }
 
-        DrawText("[P] Preset  [O] OD  [1/2] Drive  [3/4] Blend  [5-0] EQ  "
-                 "[G] Gate  [C] Cab  [ [ / ] ] Tuner Gate  [D/F2] Device  [E] Driver  [V] VSync  [Space] Mute",
+        DrawText("[P] Preset  [S/L] Save/Load JSON  [Drag Rack] Order  [O] OD  [X] OS  [1/2] Drive  [3/4] Blend  [5-0] EQ  "
+                 "[G] Gate  [C] Cab  [D/F2] Dev  [E] Drv  [Space] Mute",
                  static_cast<int>(kMarginX), screenH - 18, 12, DARKGRAY);
 
         EndDrawing();

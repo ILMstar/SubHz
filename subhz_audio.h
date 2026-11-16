@@ -404,12 +404,21 @@ public:
     float CompGainReductionDb() const noexcept { return comp_->GainReductionDb(); }
     float CompThresholdDb() const noexcept { return comp_->ThresholdDb(); }
     float CompMakeupDb() const noexcept { return comp_->MakeupGainDb(); }
+    void  SetCompThresholdDb(float db) noexcept {
+        comp_->SetThresholdDb(db);
+        presetModified_ = true;
+    }
+    void  SetCompMakeupDb(float db) noexcept {
+        comp_->SetMakeupGainDb(db);
+        presetModified_ = true;
+    }
 
     void ApplyPreset(int index) noexcept {
-        presetIndex_    = ((index % static_cast<int>(kPresets.size())) +
-                           static_cast<int>(kPresets.size())) %
-                          static_cast<int>(kPresets.size());
-        presetModified_ = false;
+        presetIndex_      = ((index % static_cast<int>(kPresets.size())) +
+                             static_cast<int>(kPresets.size())) %
+                            static_cast<int>(kPresets.size());
+        presetModified_   = false;
+        customPresetName_[0] = '\0';
         const TonePreset& p = kPresets[presetIndex_];
         comp_->SetThresholdDb(p.compThreshDb);
         comp_->SetMakeupGainDb(p.compMakeupDb);
@@ -423,8 +432,77 @@ public:
     }
     void        CyclePreset() noexcept { ApplyPreset(presetIndex_ + 1); }
     int         PresetIndex() const noexcept { return presetIndex_; }
-    const char* PresetName() const noexcept { return kPresets[presetIndex_].name; }
+    const char* PresetName() const noexcept {
+        return customPresetName_[0] != '\0' ? customPresetName_ : kPresets[presetIndex_].name;
+    }
     bool        PresetModified() const noexcept { return presetModified_; }
+
+    // ---- JSON Preset Export / Import ------------------------------------------------
+    void ExportRigPreset(RigPreset& p, const char* customName = nullptr) const noexcept {
+        std::snprintf(p.name, sizeof(p.name), "%s",
+                      (customName && customName[0] != '\0') ? customName : PresetName());
+        p.trim         = Trim();
+        p.gateEnabled  = GateEnabled();
+        p.compThreshDb = CompThresholdDb();
+        p.compMakeupDb = CompMakeupDb();
+        p.odBypass     = !OverdriveEnabled();
+        p.odDrive      = Drive();
+        p.odBlend      = Blend();
+        p.odOversample = OverdriveOversample();
+        p.bassDb       = BassDb();
+        p.midDb        = MidDb();
+        p.trebleDb     = TrebleDb();
+        p.cabEnabled   = CabEnabled();
+        p.chainOrder   = GetChainOrder();
+    }
+
+    void ImportRigPreset(const RigPreset& p) noexcept {
+        std::snprintf(customPresetName_, sizeof(customPresetName_), "%s", p.name);
+        SetTrim(p.trim);
+        gate_->SetEnabled(p.gateEnabled);
+        comp_->SetThresholdDb(p.compThreshDb);
+        comp_->SetMakeupGainDb(p.compMakeupDb);
+        overdrive_->SetBypass(p.odBypass);
+        overdrive_->SetDrive(p.odDrive);
+        overdrive_->SetBlend(p.odBlend);
+        overdrive_->SetOversample(p.odOversample);
+        eq_->SetBassDb(p.bassDb);
+        eq_->SetMidDb(p.midDb);
+        eq_->SetTrebleDb(p.trebleDb);
+        cab_->SetCabEnabled(p.cabEnabled);
+        if (IsValidChainOrder(p.chainOrder)) {
+            packedOrder_.store(PackOrder(p.chainOrder), std::memory_order_relaxed);
+        }
+        presetModified_ = false;
+    }
+
+    bool SaveRigPresetJson(const char* path = cfg::kPresetJsonFile,
+                           const char* customName = nullptr) noexcept {
+        RigPreset p{};
+        ExportRigPreset(p, customName);
+        if (!SavePresetJson(path, p)) {
+            SetNotice("FAILED TO SAVE JSON PRESET", true);
+            return false;
+        }
+        char msg[160]{};
+        std::snprintf(msg, sizeof(msg), "SAVED JSON PRESET [S]: %.100s", path);
+        SetNotice(msg, false);
+        return true;
+    }
+
+    bool LoadRigPresetJson(const char* path = cfg::kPresetJsonFile) noexcept {
+        RigPreset p{};
+        ExportRigPreset(p);
+        if (!LoadPresetJson(path, p)) {
+            SetNotice("JSON PRESET NOT FOUND - PRESS [S] TO SAVE FIRST", true);
+            return false;
+        }
+        ImportRigPreset(p);
+        char msg[160]{};
+        std::snprintf(msg, sizeof(msg), "LOADED JSON PRESET [L]: %.100s", p.name);
+        SetNotice(msg, false);
+        return true;
+    }
 
     // ---- Settings Persistence -------------------------------------------------------
     void ImportSettings(const AppSettings& s) noexcept {
@@ -697,6 +775,7 @@ private:
     std::atomic<uint64_t> callbackCount_{0};
     int                   presetIndex_    = 0;
     bool                  presetModified_ = false;
+    char                  customPresetName_[64]{};
 
     // Device & endpoint state
     ma_context                 context_{};

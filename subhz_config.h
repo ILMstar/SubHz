@@ -110,6 +110,7 @@ constexpr float  kLimitLedHoldSec    = 0.25f;
 
 constexpr double kPi                 = 3.14159265358979323846;
 constexpr const char* kConfigFile    = "subhz.cfg";
+constexpr const char* kPresetJsonFile = "subhz_preset.json";
 }  // namespace cfg
 
 // -------------------------------------------------------------------------------------
@@ -304,23 +305,172 @@ inline bool LoadSettings(const char* path, AppSettings& s) noexcept {
         char  key[64]{};
         float val = 0.0f;
         if (std::sscanf(line, "%63[^=]=%f", key, &val) == 2) {
-            if (std::strcmp(key, "trim") == 0)             s.trim        = std::clamp(val, cfg::kTrimMin, cfg::kTrimMax);
-            else if (std::strcmp(key, "inputSelect") == 0) s.inputSelect = std::clamp(static_cast<int>(val), 0, 2);
-            else if (std::strcmp(key, "presetIndex") == 0) s.presetIndex = std::clamp(static_cast<int>(val), 0, 3);
-            else if (std::strcmp(key, "gateEnabled") == 0) s.gateEnabled = (static_cast<int>(val) != 0);
-            else if (std::strcmp(key, "cabEnabled") == 0)  s.cabEnabled  = (static_cast<int>(val) != 0);
-            else if (std::strcmp(key, "odBypass") == 0)    s.odBypass    = (static_cast<int>(val) != 0);
-            else if (std::strcmp(key, "odDrive") == 0)     s.odDrive      = std::clamp(val, cfg::kDriveMin, cfg::kDriveMax);
-            else if (std::strcmp(key, "odBlend") == 0)     s.odBlend      = std::clamp(val, cfg::kBlendMin, cfg::kBlendMax);
+            if (std::strcmp(key, "trim") == 0)              s.trim         = std::clamp(val, cfg::kTrimMin, cfg::kTrimMax);
+            else if (std::strcmp(key, "inputSelect") == 0)  s.inputSelect  = std::clamp(static_cast<int>(val), 0, 2);
+            else if (std::strcmp(key, "presetIndex") == 0)  s.presetIndex  = std::clamp(static_cast<int>(val), 0, 3);
+            else if (std::strcmp(key, "gateEnabled") == 0)  s.gateEnabled  = (static_cast<int>(val) != 0);
+            else if (std::strcmp(key, "cabEnabled") == 0)   s.cabEnabled   = (static_cast<int>(val) != 0);
+            else if (std::strcmp(key, "odBypass") == 0)     s.odBypass     = (static_cast<int>(val) != 0);
+            else if (std::strcmp(key, "odDrive") == 0)      s.odDrive      = std::clamp(val, cfg::kDriveMin, cfg::kDriveMax);
+            else if (std::strcmp(key, "odBlend") == 0)      s.odBlend      = std::clamp(val, cfg::kBlendMin, cfg::kBlendMax);
             else if (std::strcmp(key, "odOversample") == 0) s.odOversample = ClampOversample(static_cast<int>(val));
-            else if (std::strcmp(key, "bassDb") == 0)      s.bassDb       = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
-            else if (std::strcmp(key, "midDb") == 0)       s.midDb       = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
-            else if (std::strcmp(key, "trebleDb") == 0)    s.trebleDb    = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
-            else if (std::strcmp(key, "tunerGateDb") == 0) s.tunerGateDb = std::clamp(val, cfg::kTunerMinGateDb, cfg::kTunerMaxGateDb);
-            else if (std::strcmp(key, "vsync") == 0)       s.vsync       = (static_cast<int>(val) != 0);
-            else if (std::strcmp(key, "exclusive") == 0)   s.exclusive   = (static_cast<int>(val) != 0);
+            else if (std::strcmp(key, "bassDb") == 0)       s.bassDb       = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
+            else if (std::strcmp(key, "midDb") == 0)        s.midDb        = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
+            else if (std::strcmp(key, "trebleDb") == 0)     s.trebleDb     = std::clamp(val, cfg::kEqMinDb, cfg::kEqMaxDb);
+            else if (std::strcmp(key, "tunerGateDb") == 0)  s.tunerGateDb  = std::clamp(val, cfg::kTunerMinGateDb, cfg::kTunerMaxGateDb);
+            else if (std::strcmp(key, "vsync") == 0)        s.vsync        = (static_cast<int>(val) != 0);
+            else if (std::strcmp(key, "exclusive") == 0)    s.exclusive    = (static_cast<int>(val) != 0);
         }
     }
     std::fclose(fp);
+    return true;
+}
+
+// -------------------------------------------------------------------------------------
+//  RigPreset: JSON serialization for user presets & custom DSP chain routing
+// -------------------------------------------------------------------------------------
+struct RigPreset {
+    char                               name[64]     = "Custom Rig";
+    float                              trim         = 1.0f;
+    bool                               gateEnabled  = false;
+    float                              compThreshDb = cfg::kCompDefaultThreshDb;
+    float                              compMakeupDb = cfg::kCompDefaultMakeupDb;
+    bool                               odBypass     = true;
+    float                              odDrive      = 2.0f;
+    float                              odBlend      = 0.0f;
+    int                                odOversample = cfg::kOdOversampleDefault;
+    float                              bassDb       = 0.0f;
+    float                              midDb        = 0.0f;
+    float                              trebleDb     = 0.0f;
+    bool                               cabEnabled   = false;
+    std::array<int, cfg::kNumDspSlots> chainOrder   = kDefaultChainOrder;
+};
+
+inline bool SavePresetJson(const char* path, const RigPreset& p) noexcept {
+    if (path == nullptr) return false;
+    std::FILE* fp = std::fopen(path, "w");
+    if (!fp) return false;
+
+    char safeName[128]{};
+    size_t j = 0;
+    for (size_t i = 0; p.name[i] != '\0' && j + 2 < sizeof(safeName); ++i) {
+        const char c = p.name[i];
+        if (c == '"' || c == '\\') safeName[j++] = '\\';
+        if (static_cast<unsigned char>(c) >= 32) safeName[j++] = c;
+    }
+
+    const auto& ord = IsValidChainOrder(p.chainOrder) ? p.chainOrder : kDefaultChainOrder;
+    std::fprintf(fp, "{\n");
+    std::fprintf(fp, "  \"name\": \"%s\",\n", safeName);
+    std::fprintf(fp, "  \"trim\": %.4f,\n", std::clamp(p.trim, cfg::kTrimMin, cfg::kTrimMax));
+    std::fprintf(fp, "  \"gateEnabled\": %s,\n", p.gateEnabled ? "true" : "false");
+    std::fprintf(fp, "  \"compThreshDb\": %.4f,\n", std::clamp(p.compThreshDb, -48.0f, 0.0f));
+    std::fprintf(fp, "  \"compMakeupDb\": %.4f,\n", std::clamp(p.compMakeupDb, -12.0f, 24.0f));
+    std::fprintf(fp, "  \"odBypass\": %s,\n", p.odBypass ? "true" : "false");
+    std::fprintf(fp, "  \"odDrive\": %.4f,\n", std::clamp(p.odDrive, cfg::kDriveMin, cfg::kDriveMax));
+    std::fprintf(fp, "  \"odBlend\": %.4f,\n", std::clamp(p.odBlend, cfg::kBlendMin, cfg::kBlendMax));
+    std::fprintf(fp, "  \"odOversample\": %d,\n", ClampOversample(p.odOversample));
+    std::fprintf(fp, "  \"bassDb\": %.4f,\n", std::clamp(p.bassDb, cfg::kEqMinDb, cfg::kEqMaxDb));
+    std::fprintf(fp, "  \"midDb\": %.4f,\n", std::clamp(p.midDb, cfg::kEqMinDb, cfg::kEqMaxDb));
+    std::fprintf(fp, "  \"trebleDb\": %.4f,\n", std::clamp(p.trebleDb, cfg::kEqMinDb, cfg::kEqMaxDb));
+    std::fprintf(fp, "  \"cabEnabled\": %s,\n", p.cabEnabled ? "true" : "false");
+    std::fprintf(fp, "  \"chainOrder\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"]\n",
+                 DspSlotName(ord[0]), DspSlotName(ord[1]), DspSlotName(ord[2]),
+                 DspSlotName(ord[3]), DspSlotName(ord[4]));
+    std::fprintf(fp, "}\n");
+    std::fclose(fp);
+    return true;
+}
+
+inline bool LoadPresetJson(const char* path, RigPreset& p) noexcept {
+    if (path == nullptr) return false;
+    std::FILE* fp = std::fopen(path, "rb");
+    if (!fp) return false;
+    char buf[4096]{};
+    const size_t nRead = std::fread(buf, 1, sizeof(buf) - 1, fp);
+    std::fclose(fp);
+    if (nRead == 0) return false;
+    buf[nRead] = '\0';
+
+    auto findKey = [&](const char* key) -> const char* {
+        char pat[64]{};
+        std::snprintf(pat, sizeof(pat), "\"%s\"", key);
+        const char* pos = std::strstr(buf, pat);
+        if (!pos) return nullptr;
+        pos = std::strchr(pos + std::strlen(pat), ':');
+        if (!pos) return nullptr;
+        ++pos;
+        while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n') ++pos;
+        return pos;
+    };
+
+    auto readFloat = [&](const char* key, float& out, float lo, float hi) {
+        if (const char* v = findKey(key)) {
+            char* end = nullptr;
+            const float f = std::strtof(v, &end);
+            if (end != v && std::isfinite(f)) out = std::clamp(f, lo, hi);
+        }
+    };
+
+    auto readBool = [&](const char* key, bool& out) {
+        if (const char* v = findKey(key)) {
+            if (std::strncmp(v, "true", 4) == 0 || *v == '1') out = true;
+            else if (std::strncmp(v, "false", 5) == 0 || *v == '0') out = false;
+        }
+    };
+
+    if (const char* v = findKey("name")) {
+        if (*v == '"') {
+            ++v;
+            size_t i = 0;
+            while (*v != '\0' && *v != '"' && i + 1 < sizeof(p.name)) {
+                if (*v == '\\' && *(v + 1) != '\0') ++v;
+                p.name[i++] = *v++;
+            }
+            p.name[i] = '\0';
+        }
+    }
+
+    readFloat("trim",         p.trim,         cfg::kTrimMin,  cfg::kTrimMax);
+    readBool ("gateEnabled",  p.gateEnabled);
+    readFloat("compThreshDb", p.compThreshDb, -48.0f,         0.0f);
+    readFloat("compMakeupDb", p.compMakeupDb, -12.0f,         24.0f);
+    readBool ("odBypass",     p.odBypass);
+    readFloat("odDrive",      p.odDrive,      cfg::kDriveMin, cfg::kDriveMax);
+    readFloat("odBlend",      p.odBlend,      cfg::kBlendMin, cfg::kBlendMax);
+    float osVal = static_cast<float>(p.odOversample);
+    readFloat("odOversample", osVal,          1.0f,           4.0f);
+    p.odOversample = ClampOversample(static_cast<int>(std::lround(osVal)));
+    readFloat("bassDb",       p.bassDb,       cfg::kEqMinDb,  cfg::kEqMaxDb);
+    readFloat("midDb",        p.midDb,        cfg::kEqMinDb,  cfg::kEqMaxDb);
+    readFloat("trebleDb",     p.trebleDb,     cfg::kEqMinDb,  cfg::kEqMaxDb);
+    readBool ("cabEnabled",   p.cabEnabled);
+
+    if (const char* v = findKey("chainOrder")) {
+        if (*v == '[') {
+            ++v;
+            std::array<int, cfg::kNumDspSlots> cand{};
+            int count = 0;
+            while (*v != '\0' && *v != ']' && count < cfg::kNumDspSlots) {
+                while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n' || *v == ',') ++v;
+                if (*v == '"') {
+                    ++v;
+                    char tok[16]{};
+                    size_t ti = 0;
+                    while (*v != '\0' && *v != '"' && ti + 1 < sizeof(tok)) tok[ti++] = *v++;
+                    if (*v == '"') ++v;
+                    cand[count++] = DspSlotFromName(tok);
+                } else if (*v >= '0' && *v <= '9') {
+                    cand[count++] = *v - '0';
+                    ++v;
+                } else {
+                    break;
+                }
+            }
+            if (count == cfg::kNumDspSlots && IsValidChainOrder(cand)) {
+                p.chainOrder = cand;
+            }
+        }
+    }
     return true;
 }
