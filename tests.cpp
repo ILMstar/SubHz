@@ -406,6 +406,134 @@ int main() {
         std::printf("[PASS] 14. Config persistence round-trip, +40 dB limiter & NaN safety verified\n");
     }
 
-    std::printf("\nALL 14 SUBHZ AUDIT VERIFICATION TESTS PASSED!\n");
+    // =================================================================================
+    //  TEST 15: Dynamic DSP Chain Reordering (Rack Order Dragging & Signal Routing)
+    // =================================================================================
+    {
+        AudioEngine engine;
+        assert((engine.GetChainOrder() == std::array<int, 5>{ 0, 1, 2, 3, 4 }));
+        assert(!engine.SetChainOrder({ 0, 1, 2, 2, 4 })); // duplicate slot rejected
+        assert(!engine.SetChainOrder({ 0, 1, 2, 3, 9 })); // out-of-range rejected
+
+        // Drag OD (pos 2) before COMP (pos 1): [GATE, OD, COMP, EQ, CAB]
+        assert(engine.MoveChainSlot(2, 1));
+        assert((engine.GetChainOrder() == std::array<int, 5>{ kSlotGate, kSlotOd, kSlotComp, kSlotEq, kSlotCab }));
+
+        // Verify EQ -> OD vs OD -> EQ produces distinct nonlinear saturation output
+        auto renderOrder = [&](const std::array<int, 5>& ord) -> float {
+            AudioEngine eng;
+            eng.ToggleMute();
+            eng.SetOverdriveBypass(false);
+            eng.SetDrive(16.0f);
+            eng.SetBlend(1.0f);
+            eng.SetMidDb(15.0f); // +15 dB @ 650 Hz: before OD drives harder into tanh; after OD boosts output
+            assert(eng.SetChainOrder(ord));
+
+            std::array<float, 256> in{};
+            std::array<float, 256> out{};
+            double rms = 0.0;
+            size_t idx = 0;
+            for (int b = 0; b < 40; ++b) {
+                for (size_t i = 0; i < 128; ++i) {
+                    const float s = 0.25f * std::sin(static_cast<float>(2.0 * cfg::kPi * 650.0 * idx++ / kSr));
+                    in[2 * i]     = s;
+                    in[2 * i + 1] = s;
+                }
+                eng.ProcessInterleaved(out.data(), in.data(), 128);
+                if (b >= 20) {
+                    for (size_t i = 0; i < 128; ++i) rms += out[2 * i] * out[2 * i];
+                }
+            }
+            return static_cast<float>(std::sqrt(rms / (20.0 * 128.0)));
+        };
+
+        const float rmsEqBeforeOd = renderOrder({ kSlotGate, kSlotComp, kSlotEq, kSlotOd, kSlotCab });
+        const float rmsOdBeforeEq = renderOrder({ kSlotGate, kSlotComp, kSlotOd, kSlotEq, kSlotCab });
+        assert(std::fabs(rmsOdBeforeEq - rmsEqBeforeOd) > 0.08f);
+        std::printf("[PASS] 15. Dynamic DSP chain reordering (EQ->OD rms=%.3f vs OD->EQ rms=%.3f)\n",
+                    rmsEqBeforeOd, rmsOdBeforeEq);
+    }
+
+    // =================================================================================
+    //  TEST 16: Overdrive 2x / 4x (192 kHz) Oversampling Anti-Aliasing
+    // =================================================================================
+    {
+        // 6800 Hz sine @ 48 kHz: 7th harmonic is 47600 Hz, which aliases to 400 Hz at 1x.
+        // At 4x (192 kHz), 47600 Hz is below the 96 kHz Nyquist and attenuated by the
+        // 19.2 kHz 4th-order Butterworth anti-aliasing filter before decimation.
+        auto measureAliasAt400Hz = [&](int osFactor) -> float {
+            BassOverdriveNode od;
+            od.SetBypass(false);
+            od.SetDrive(14.0f);
+            od.SetBlend(1.0f);
+            od.SetOversample(osFactor);
+
+            std::array<float, cfg::kFftSize> snap{};
+            for (size_t i = 0; i < 2 * cfg::kFftSize; ++i) {
+                const float x = 0.5f * std::sin(static_cast<float>(2.0 * cfg::kPi * 6800.0 * i / kSr));
+                const float y = od.process(x, kSr);
+                if (i >= cfg::kFftSize) snap[i - cfg::kFftSize] = y;
+            }
+            ComputeMagnitudes(snap, hann, fftBuf, mags);
+            const size_t bin400 = static_cast<size_t>(std::lround(400.0f / binWidth));
+            return std::max({ mags[bin400 - 1], mags[bin400], mags[bin400 + 1] });
+        };
+
+        const float alias1x = measureAliasAt400Hz(1);
+        const float alias2x = measureAliasAt400Hz(2);
+        const float alias4x = measureAliasAt400Hz(4);
+        const float reductionDb = 20.0f * std::log10(std::max(alias1x, 1e-9f) / std::max(alias4x, 1e-9f));
+        std::printf("[INFO] Overdrive 400 Hz alias foldback: 1x=%.5f, 2x=%.5f, 4x=%.5f (-%.1f dB)\n",
+                    alias1x, alias2x, alias4x, reductionDb);
+        assert(alias4x < alias1x * 0.15f && alias2x < alias1x * 0.5f);
+        std::printf("[PASS] 16. Overdrive 2x/4x (192 kHz) oversampling anti-aliasing verified\n");
+    }
+
+    // =================================================================================
+    //  TEST 17: JSON Rig Preset Export / Import Serialization
+    // =================================================================================
+    {
+        AudioEngine srcEngine;
+        srcEngine.SetTrim(1.75f);
+        srcEngine.SetGateEnabled(true);
+        srcEngine.SetCompThresholdDb(-24.0f);
+        srcEngine.SetCompMakeupDb(4.0f);
+        srcEngine.SetOverdriveBypass(false);
+        srcEngine.SetDrive(18.5f);
+        srcEngine.SetBlend(0.85f);
+        srcEngine.SetOverdriveOversample(4);
+        srcEngine.SetBassDb(5.0f);
+        srcEngine.SetMidDb(-3.5f);
+        srcEngine.SetTrebleDb(4.0f);
+        srcEngine.SetCabEnabled(true);
+        const std::array<int, 5> customOrd = { kSlotGate, kSlotOd, kSlotComp, kSlotEq, kSlotCab };
+        assert(srcEngine.SetChainOrder(customOrd));
+
+        const char* tmpJson = "subhz_test_preset.json";
+        assert(srcEngine.SaveRigPresetJson(tmpJson, "Smashing Pumpkins Fuzz Bass"));
+
+        AudioEngine dstEngine;
+        assert(dstEngine.LoadRigPresetJson(tmpJson));
+        std::remove(tmpJson);
+
+        assert(std::strcmp(dstEngine.PresetName(), "Smashing Pumpkins Fuzz Bass") == 0);
+        assert(std::fabs(dstEngine.Trim() - 1.75f) < 1e-3f);
+        assert(dstEngine.GateEnabled() == true);
+        assert(std::fabs(dstEngine.CompThresholdDb() - (-24.0f)) < 1e-3f);
+        assert(std::fabs(dstEngine.CompMakeupDb() - 4.0f) < 1e-3f);
+        assert(dstEngine.OverdriveEnabled() == true);
+        assert(std::fabs(dstEngine.Drive() - 18.5f) < 1e-3f);
+        assert(std::fabs(dstEngine.Blend() - 0.85f) < 1e-3f);
+        assert(dstEngine.OverdriveOversample() == 4);
+        assert(std::fabs(dstEngine.BassDb() - 5.0f) < 1e-3f);
+        assert(std::fabs(dstEngine.MidDb() - (-3.5f)) < 1e-3f);
+        assert(std::fabs(dstEngine.TrebleDb() - 4.0f) < 1e-3f);
+        assert(dstEngine.CabEnabled() == true);
+        assert(dstEngine.GetChainOrder() == customOrd);
+        std::printf("[PASS] 17. JSON preset export/import ('%s') & chainOrder verified\n",
+                    dstEngine.PresetName());
+    }
+
+    std::printf("\nALL 17 SUBHZ AUDIT VERIFICATION TESTS PASSED!\n");
     return 0;
 }

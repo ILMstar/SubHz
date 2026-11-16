@@ -17,15 +17,17 @@ Real-time full-duplex bass & vocal DSP rig, spectrum visualizer, and chromatic t
   - **Dry tap** (10 Hz DC-blocked, pre-FX) → hybrid YIN + FFT chromatic tuner.
   - **Wet tap (48 kHz)** → Schmitt-triggered oscilloscope + high-band FFT spectrum (`900 Hz – 10 kHz`).
   - **Low-Band Wet tap (12 kHz, 4× decimated)** → high-resolution `2.93 Hz`/bin low-frequency FFT (`20 Hz – 900 Hz`) so 5-string `B0 (30.87 Hz)` and `E1 (41.20 Hz)` sit `3.52` bins apart and resolve as sharp, distinct peaks.
-- **Modular 6-Stage OOP DSP Chain** (`IDspNode` in `subhz_dsp.h`):
-  `HPF 10 Hz → Noise Gate → Optical Compressor → Split-Band Overdrive (+ 15 Hz DC Block) → 3-Band EQ → Cab Sim → Limiter`
+- **Dynamic Reorderable 6-Stage OOP DSP Chain** (`IDspNode` in `subhz_dsp.h`):
+  `HPF 10 Hz → [Reorderable Rack: Noise Gate ⇄ Optical Compressor ⇄ Split-Band Overdrive ⇄ 3-Band EQ ⇄ Cab Sim] → Limiter`
+  - Drag any pedal block (`GATE`, `COMP`, `OD`, `EQ`, `CAB`) left/right with the mouse in the top-right Signal Flow rack to reorder effects live (`std::atomic<uint32_t>` wait-free permutation on the audio thread).
   1. `DcBlockerNode`: 1st-order **10 Hz** high-pass filter (`−0.43 dB` at `B0 = 30.87 Hz`, `−0.25 dB` at `E1 = 41.20 Hz`, `−0.14 dB` at `A1 = 55.00 Hz`).
   2. `EnvelopeNoiseGateNode` (`G`): 1 ms attack / 80 ms release with hysteresis (open `−54 dBFS` / close `−62 dBFS`), off by default.
   3. `CompressorNode`: Feed-forward optical bass compressor (`10 ms` attack, single-stage `120 ms` release to `37%`, `4:1` ratio) with `6.67 ms` peak bridging, `15 ms` click-free parameter smoothing, and live Gain Reduction (`GR`) telemetry.
-  4. `BassOverdriveNode` (`O`, `1/2`, `3/4`): Phase-coherent 1st-order crossover at **150 Hz** keeps sub-bass `< 150 Hz` clean and tight while driving `> 150 Hz` through asymmetric tube-style soft clipping (`tanh(x * drive + 0.1) - tanh(0.1)`) with automatic gain compensation, a **post-saturation 15 Hz DC blocker** (`< −66 dBFS` residual DC), and smoothed dry/wet blend.
+  4. `BassOverdriveNode` (`O`, `X`, `1/2`, `3/4`): Phase-coherent 1st-order crossover at **150 Hz** keeps sub-bass `< 150 Hz` clean and tight while driving `> 150 Hz` through **2× / 4× (`192 kHz`) oversampled** asymmetric tube-style soft clipping (`tanh(u * drive + 0.1) - tanh(0.1)`) with a **4th-order Butterworth anti-aliasing LPF**, automatic gain compensation, a **post-saturation 15 Hz DC blocker** (`< −66 dBFS` residual DC), and smoothed dry/wet blend.
   5. `ThreeBandEqNode` (`5/6`, `7/8`, `9/0`): 3 cascaded RBJ Audio EQ Cookbook biquads in **Transposed Direct Form II** with `15 ms` parameter smoothing and steady-state coefficient caching (Bass low-shelf `80 Hz Q=0.707`, Mid peaking `650 Hz Q=1.0`, Treble high-shelf `3.2 kHz Q=0.707`, each `±15 dB`).
   6. `CabSimNode` (`C`): 2nd-order Butterworth low-pass at 4.5 kHz with 10 ms click-free crossfade.
-- **4 Click-Free Built-In Tone Presets** (`P`):
+- **4 Click-Free Built-In Tone Presets (`P`) + JSON Rig Export/Import (`S` / `L`)**:
+  - Save (`S`) and load (`L`) full custom rigs (including custom name, EQ/OD/Comp/Gate/Cab settings, oversampling factor, and custom DSP chain order) to/from `subhz_preset.json`.
   1. **Clean Studio DI** *(Default)* — Flat EQ, Drive off, light optical compression (`−18 dB` / `+1.5 dB`), Cab off.
   2. **Warm Motown Vintage** — Bass `+4 dB`, Mid `+2 dB`, Treble `−6 dB`, Cab Sim ON.
   3. **Modern Slap Scoop** — Bass `+5 dB`, Mid `−6 dB`, Treble `+6 dB`, high compression (`−26 dB` / `+5.0 dB`).
@@ -45,7 +47,10 @@ Real-time full-duplex bass & vocal DSP rig, spectrum visualizer, and chromatic t
 |---|---|---|
 | **Space** | Toggle live speaker monitoring (`MUTED` / `LIVE`) | `MUTED` |
 | **P** | Cycle 4 built-in Bass Tone Presets (click-free smoothed) | `Clean Studio DI` |
+| **S / L** | Save / Load full custom rig & DSP chain order (`subhz_preset.json`) | `subhz_preset.json` |
+| **Mouse Drag** | Drag `GATE`, `COMP`, `OD`, `EQ`, `CAB` boxes in rack to reorder chain | `GATE>COMP>OD>EQ>CAB` |
 | **O** | Toggle Split-Band Overdrive bypass | `OFF` |
+| **X** | Cycle Overdrive oversampling (`1x` / `2x` / `4x` @ `192 kHz`) | `4x (192 kHz)` |
 | **1 / 2** | Decrease / Increase Overdrive Drive (`1.0x – 25.0x`) | `2.0x` |
 | **3 / 4** | Decrease / Increase Overdrive Dry/Wet Blend (`0% – 100%`) | `0%` |
 | **5 / 6** | Decrease / Increase Bass EQ (`80 Hz`, `±15 dB`) | `0.0 dB` |
