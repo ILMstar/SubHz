@@ -542,22 +542,202 @@ static void DrawAmpVisualizerCabinet(
 }
 
 // -------------------------------------------------------------------------------------
-//  3. Lower Signal Chain Strip (compact rack before full stompbox stage)
+//  3. Lower Signal Chain / Pedalboard Stage (AmpliTube-style routing + draggable pedals)
 // -------------------------------------------------------------------------------------
 static void DrawSignalChainStage(AudioEngine& engine, int x, int y, int w, int h,
                                  int& dragSlot, float& dragStartX, bool& dragMoved) {
-    (void)dragStartX;
-    (void)dragMoved;
-    DrawRectangle(x, y, w, h, ui_col::kStageBg);
+    // Divider header strip (like AmpliTube's "Brit 8000" model bar)
+    constexpr int kStripH = 28;
+    DrawRectangle(x, y, w, kStripH, Color{ 0x1A, 0x1A, 0x1F, 0xFF });
     DrawLine(x, y, x + w, y, ui_col::kGrid);
-    const auto ord = engine.GetChainOrder();
-    int sx = x + 24;
-    const int sy = y + h / 2 - 12;
-    for (int s = 0; s < cfg::kNumDspSlots; ++s) {
-        if (DrawButton(sx + s * 96, sy, 84, 24, DspSlotName(ord[s]), 11,
-                       LIGHTGRAY, ui_col::kPanelBg, ui_col::kBrassMid, engine.IsNodeActive(ord[s]))) {
-            dragSlot = s;
+    DrawLine(x, y + kStripH - 1, x + w, y + kStripH - 1, ui_col::kGrid);
+
+    const int badgeW = 240;
+    const int badgeX = x + (w - badgeW) / 2;
+    DrawRectangle(badgeX, y + 3, badgeW, kStripH - 6, Color{ 0x11, 0x11, 0x15, 0xFF });
+    DrawRectangleLines(badgeX, y + 3, badgeW, kStripH - 6, ui_col::kBrassMid);
+    DrawCircle(badgeX + 13, y + kStripH / 2, 4.5f, ui_col::kBrassHi);
+    DrawText(engine.PresetName(), badgeX + 26, y + 8, 12, LIGHTGRAY);
+
+    // Oversampling & Reset Order buttons on the divider strip
+    if (DrawButton(x + 12, y + 4, 118, kStripH - 8,
+                   TextFormat("OD OS [X]: %dx (%dk)", engine.OverdriveOversample(),
+                              static_cast<int>(engine.SampleRate() * engine.OverdriveOversample() / 1000.0f)),
+                   10, ui_col::kBrassHi, ui_col::kPanelBg, ui_col::kBrassMid)) {
+        engine.CycleOverdriveOversample();
+    }
+    if (engine.GetChainOrder() != kDefaultChainOrder) {
+        if (DrawButton(x + 138, y + 4, 96, kStripH - 8, "RESET CHAIN", 10,
+                       LIGHTGRAY, ui_col::kPanelBg, ui_col::kGrid)) {
+            engine.ResetChainOrder();
         }
+    }
+    DrawText("DRAG PEDALS TO REORDER  |  CLICK PEDAL TO BYPASS",
+             x + w - 295, y + 9, 10, GRAY);
+
+    // Main Routing Graph Stage
+    const int stageY = y + kStripH;
+    const int stageH = h - kStripH;
+    DrawRectangle(x, stageY, w, stageH, ui_col::kStageBg);
+
+    const int busY = stageY + stageH / 2 + 4;
+
+    // Left routing decorative icons (AmpliTube style)
+    for (int i = 0; i < 3; ++i) {
+        const int iy = stageY + 18 + i * 28;
+        DrawRectangle(x + 12, iy, 24, 22, (i == 0) ? Color{ 0x26, 0x22, 0x18, 0xFF } : ui_col::kPanelBg);
+        DrawRectangleLines(x + 12, iy, 24, 22, (i == 0) ? ui_col::kBrassHi : ui_col::kGrid);
+        DrawLine(x + 16, iy + 11, x + 32, iy + 11, (i == 0) ? ui_col::kBrassHi : GRAY);
+    }
+
+    // Signal Cable Bus Line across the stage
+    const int busStartX = x + 52;
+    const int busEndX   = x + w - 24;
+    DrawLineEx({ static_cast<float>(busStartX), static_cast<float>(busY - 2) },
+               { static_cast<float>(busEndX),   static_cast<float>(busY - 2) },
+               2.5f, ui_col::kCableActive);
+    DrawLineEx({ static_cast<float>(busStartX), static_cast<float>(busY + 2) },
+               { static_cast<float>(busEndX),   static_cast<float>(busY + 2) },
+               1.5f, Fade(ui_col::kBrassHi, 0.45f));
+
+    // Fixed Input HPF node (left) & Fixed Safety Limiter node (right)
+    DrawRectangle(busStartX, busY - 18, 52, 36, ui_col::kPanelBg);
+    DrawRectangleLines(busStartX, busY - 18, 52, 36, ui_col::kNeon);
+    DrawText("HPF", busStartX + 15, busY - 11, 10, ui_col::kNeon);
+    DrawText("10 Hz", busStartX + 12, busY + 2, 10, GRAY);
+
+    const int limX = busEndX - 56;
+    DrawRectangle(limX, busY - 18, 52, 36, ui_col::kPanelBg);
+    DrawRectangleLines(limX, busY - 18, 52, 36, ui_col::kTuneOrange);
+    DrawText("LIM", limX + 16, busY - 11, 10, ui_col::kTuneOrange);
+    DrawText("tanh", limX + 14, busY + 2, 10, GRAY);
+
+    // 5 Reorderable Pedal Stompboxes along the signal bus
+    const int rackLeft  = busStartX + 70;
+    const int rackRight = limX - 18;
+    const int rackW     = std::max(320, rackRight - rackLeft);
+    const int slotStep  = rackW / cfg::kNumDspSlots;
+    const int pedalW    = std::clamp(slotStep - 18, 68, 108);
+    const int pedalH    = std::clamp(stageH - 28, 86, 126);
+    const int pedalY    = busY - pedalH / 2;
+
+    const Vector2 mouse = GetMousePosition();
+    int hoverSlot = -1;
+    for (int s = 0; s < cfg::kNumDspSlots; ++s) {
+        const int px = rackLeft + s * slotStep + (slotStep - pedalW) / 2;
+        if (PointInRect(mouse, px, pedalY, pedalW, pedalH)) {
+            hoverSlot = s;
+        }
+    }
+
+    if (hoverSlot >= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        dragSlot   = hoverSlot;
+        dragStartX = mouse.x;
+        dragMoved  = false;
+    }
+    if (dragSlot >= 0) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            if (std::fabs(mouse.x - dragStartX) > 6.0f) dragMoved = true;
+            if (hoverSlot >= 0 && hoverSlot != dragSlot) {
+                engine.MoveChainSlot(dragSlot, hoverSlot);
+                dragSlot  = hoverSlot;
+                dragMoved = true;
+            }
+        } else {
+            // Simple click without dragging toggles the pedal's bypass state
+            if (!dragMoved && hoverSlot == dragSlot) {
+                const int clickedNode = engine.GetChainOrder()[dragSlot];
+                if (clickedNode == kSlotGate)     engine.ToggleGate();
+                else if (clickedNode == kSlotOd)  engine.ToggleOverdrive();
+                else if (clickedNode == kSlotCab) engine.ToggleCab();
+            }
+            dragSlot  = -1;
+            dragMoved = false;
+        }
+    }
+
+    const auto order = engine.GetChainOrder();
+    for (int s = 0; s < cfg::kNumDspSlots; ++s) {
+        const int  nodeId   = order[s];
+        const bool active   = engine.IsNodeActive(nodeId);
+        const bool dragging = (dragSlot == s);
+        const bool hovered  = (hoverSlot == s);
+        const int  px       = rackLeft + s * slotStep + (slotStep - pedalW) / 2;
+        const int  py       = dragging ? (pedalY - 5) : pedalY;
+
+        // Distinct hardware stompbox palette per effect type
+        Color bodyCol   = { 0x20, 0x22, 0x28, 0xFF };
+        Color accentCol = ui_col::kNeon;
+        const char* title = DspSlotName(nodeId);
+        char sub1[32]{};
+        char sub2[32]{};
+
+        switch (nodeId) {
+            case kSlotGate:
+                bodyCol   = { 0x14, 0x2A, 0x22, 0xFF };
+                accentCol = ui_col::kTuneGreen;
+                title     = "NOISE GATE";
+                std::snprintf(sub1, sizeof(sub1), "%s [G]", engine.GateEnabled() ? "ACTIVE" : "BYPASS");
+                std::snprintf(sub2, sizeof(sub2), "-54 / -62 dB");
+                break;
+            case kSlotComp:
+                bodyCol   = { 0x16, 0x24, 0x38, 0xFF };
+                accentCol = ui_col::kNeonLow;
+                title     = "OPTICAL COMP";
+                std::snprintf(sub1, sizeof(sub1), "4:1  %.0f dB", engine.CompThresholdDb());
+                std::snprintf(sub2, sizeof(sub2), "GR -%.1f dB", engine.CompGainReductionDb());
+                break;
+            case kSlotOd:
+                bodyCol   = { 0x38, 0x20, 0x12, 0xFF };
+                accentCol = ui_col::kTuneOrange;
+                title     = "TUBE DRIVE";
+                std::snprintf(sub1, sizeof(sub1), "%.1fx  %d%% [O]",
+                              engine.Drive(), static_cast<int>(std::round(engine.Blend() * 100.0f)));
+                std::snprintf(sub2, sizeof(sub2), "OS %dx (192k)", engine.OverdriveOversample());
+                break;
+            case kSlotEq:
+                bodyCol   = { 0x1E, 0x20, 0x2C, 0xFF };
+                accentCol = ui_col::kNeon;
+                title     = "3-BAND EQ";
+                std::snprintf(sub1, sizeof(sub1), "B:%+.0f M:%+.0f", engine.BassDb(), engine.MidDb());
+                std::snprintf(sub2, sizeof(sub2), "T:%+.0f dB", engine.TrebleDb());
+                break;
+            case kSlotCab:
+                bodyCol   = { 0x2A, 0x22, 0x16, 0xFF };
+                accentCol = ui_col::kBrassHi;
+                title     = "CAB SIM";
+                std::snprintf(sub1, sizeof(sub1), "%s [C]", engine.CabEnabled() ? "4.5 kHz" : "BYPASS");
+                std::snprintf(sub2, sizeof(sub2), "Butterworth");
+                break;
+        }
+
+        if (!active) bodyCol = BlendColor(bodyCol, Color{ 0x12, 0x12, 0x15, 0xFF }, 0.65f);
+
+        // Pedal shadow & chassis
+        DrawRectangle(px + 2, py + 3, pedalW, pedalH, Color{ 0x04, 0x04, 0x06, 0xAA });
+        DrawRectangle(px, py, pedalW, pedalH, bodyCol);
+        DrawRectangleLinesEx({ static_cast<float>(px), static_cast<float>(py),
+                               static_cast<float>(pedalW), static_cast<float>(pedalH) },
+                             dragging ? 2.5f : 1.5f,
+                             dragging ? ui_col::kBrassHi : (active || hovered ? accentCol : ui_col::kGrid));
+
+        // Status LED at top center of stompbox
+        DrawCircle(px + pedalW / 2, py + 9, 3.5f, active ? accentCol : Color{ 0x30, 0x30, 0x35, 0xFF });
+
+        // Pedal title & telemetry
+        const int tw = MeasureText(title, 10);
+        DrawText(title, px + (pedalW - tw) / 2, py + 16, 10, active ? RAYWHITE : GRAY);
+
+        DrawRectangle(px + 6, py + 30, pedalW - 12, pedalH - 54, Color{ 0x0E, 0x0E, 0x12, 0xCC });
+        const int s1w = MeasureText(sub1, 10);
+        const int s2w = MeasureText(sub2, 10);
+        DrawText(sub1, px + (pedalW - s1w) / 2, py + 35, 10, active ? accentCol : DARKGRAY);
+        DrawText(sub2, px + (pedalW - s2w) / 2, py + 49, 10, GRAY);
+
+        // Footswitch plate at bottom of stompbox
+        DrawRectangle(px + 8, py + pedalH - 20, pedalW - 16, 14, Color{ 0x14, 0x14, 0x18, 0xFF });
+        DrawCircle(px + pedalW / 2, py + pedalH - 13, 4.5f, Color{ 0x90, 0x90, 0x98, 0xFF });
+        DrawCircleLines(px + pedalW / 2, py + pedalH - 13, 4.5f, Color{ 0x20, 0x20, 0x24, 0xFF });
     }
 }
 
