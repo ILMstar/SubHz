@@ -29,8 +29,9 @@ public:
     using History = LockFreeHistoryBuffer<cfg::kFftSize>;
 
     AudioEngine() {
-        // Chain is fully built (and never resized) before the device starts:
-        // [DcBlocker 10Hz] -> [NoiseGate] -> [Compressor] -> [Overdrive] -> [3BandEQ] -> [CabSim]
+        // Chain is built once before the device starts:
+        // Fixed input stage: [DcBlocker 10Hz] -> dry tap
+        // Dynamic reorderable rack: [NoiseGate, Compressor, Overdrive, 3BandEQ, CabSim]
         auto dcBlocker = std::make_unique<DcBlockerNode>();
         auto gate      = std::make_unique<EnvelopeNoiseGateNode>();
         auto comp      = std::make_unique<CompressorNode>();
@@ -43,6 +44,7 @@ public:
         overdrive_ = overdrive.get();
         eq_        = eq.get();
         cab_       = cab.get();
+        rackNodes_ = { gate_, comp_, overdrive_, eq_, cab_ };
         dspChain_.reserve(6);
         dspChain_.push_back(std::move(dcBlocker));
         dspChain_.push_back(std::move(gate));
@@ -192,10 +194,11 @@ public:
         ScopedDenormalGuard denormalGuard;
         callbackCount_.fetch_add(1, std::memory_order_relaxed);
 
-        const int   select     = inputSelect_.load(std::memory_order_relaxed);
-        const float trim       = trim_.load(std::memory_order_relaxed);
-        const float muteTarget = muted_.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
-        const float sr         = sampleRate_;
+        const int      select     = inputSelect_.load(std::memory_order_relaxed);
+        const float    trim       = trim_.load(std::memory_order_relaxed);
+        const float    muteTarget = muted_.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
+        const uint32_t ord        = packedOrder_.load(std::memory_order_relaxed);
+        const float    sr         = sampleRate_;
 
         float inPeak     = 0.0f;
         float outPeak    = 0.0f;
@@ -226,9 +229,12 @@ public:
                 float x = rawX * trim;
                 if (!std::isfinite(x)) x = 0.0f;
 
-                for (const auto& node : dspChain_) x = node->process(x, sr);
+                x = dcBlocker_->process(x, sr);
+                dryScratch_[i] = x;                               // Pre-FX tap (DC-blocked)
 
-                dryScratch_[i] = dcBlocker_->LastOutput();        // Pre-FX tap
+                for (int s = 0; s < cfg::kNumDspSlots; ++s) {
+                    x = rackNodes_[(ord >> (s * 4)) & 0x7u]->process(x, sr);
+                }
                 const float y  = SoftKneeLimit(x, limited);
                 wetScratch_[i] = y;                               // Post-FX tap (pre-mute)
 
@@ -329,6 +335,56 @@ public:
         SetNotice(msg, false);
     }
 
+    // ---- Dynamic DSP Rack Order (lock-free atomic permutation) ----------------------
+    std::array<int, cfg::kNumDspSlots> GetChainOrder() const noexcept {
+        return UnpackOrder(packedOrder_.load(std::memory_order_relaxed));
+    }
+    bool SetChainOrder(const std::array<int, cfg::kNumDspSlots>& order) noexcept {
+        if (!IsValidChainOrder(order)) return false;
+        packedOrder_.store(PackOrder(order), std::memory_order_relaxed);
+        presetModified_ = true;
+        return true;
+    }
+    bool SwapChainSlots(int posA, int posB) noexcept {
+        if (posA < 0 || posA >= cfg::kNumDspSlots || posB < 0 || posB >= cfg::kNumDspSlots) {
+            return false;
+        }
+        if (posA == posB) return true;
+        auto ord = GetChainOrder();
+        std::swap(ord[posA], ord[posB]);
+        return SetChainOrder(ord);
+    }
+    bool MoveChainSlot(int fromPos, int toPos) noexcept {
+        if (fromPos < 0 || fromPos >= cfg::kNumDspSlots ||
+            toPos   < 0 || toPos   >= cfg::kNumDspSlots) {
+            return false;
+        }
+        if (fromPos == toPos) return true;
+        auto ord = GetChainOrder();
+        const int moved = ord[fromPos];
+        if (fromPos < toPos) {
+            for (int i = fromPos; i < toPos; ++i) ord[i] = ord[i + 1];
+        } else {
+            for (int i = fromPos; i > toPos; --i) ord[i] = ord[i - 1];
+        }
+        ord[toPos] = moved;
+        return SetChainOrder(ord);
+    }
+    void ResetChainOrder() noexcept {
+        packedOrder_.store(PackOrder(kDefaultChainOrder), std::memory_order_relaxed);
+    }
+    bool IsNodeActive(int slotId) const noexcept {
+        switch (slotId) {
+            case kSlotGate: return GateEnabled();
+            case kSlotComp: return true;
+            case kSlotOd:   return OverdriveEnabled();
+            case kSlotEq:   return std::fabs(BassDb()) > 0.05f || std::fabs(MidDb()) > 0.05f ||
+                                   std::fabs(TrebleDb()) > 0.05f;
+            case kSlotCab:  return CabEnabled();
+            default:        return false;
+        }
+    }
+
     void  SetBassDb(float db) noexcept {
         eq_->SetBassDb(db);
         presetModified_ = true;
@@ -384,29 +440,34 @@ public:
         eq_->SetBassDb(s.bassDb);
         eq_->SetMidDb(s.midDb);
         eq_->SetTrebleDb(s.trebleDb);
+        if (IsValidChainOrder(s.chainOrder)) {
+            packedOrder_.store(PackOrder(s.chainOrder), std::memory_order_relaxed);
+        }
         const TonePreset& p = kPresets[presetIndex_];
         presetModified_ = (s.cabEnabled != p.cabEnabled || s.odBypass != p.odBypass ||
                            std::fabs(s.odDrive - p.odDrive) > 1e-3f ||
                            std::fabs(s.odBlend - p.odBlend) > 1e-3f ||
                            std::fabs(s.bassDb - p.bassDb) > 1e-3f ||
                            std::fabs(s.midDb - p.midDb) > 1e-3f ||
-                           std::fabs(s.trebleDb - p.trebleDb) > 1e-3f);
+                           std::fabs(s.trebleDb - p.trebleDb) > 1e-3f ||
+                           GetChainOrder() != kDefaultChainOrder);
     }
 
     void ExportSettings(AppSettings& s) const noexcept {
-        s.trim        = Trim();
-        s.inputSelect = static_cast<int>(Input());
-        s.presetIndex = PresetIndex();
-        s.gateEnabled = GateEnabled();
-        s.cabEnabled  = CabEnabled();
-        s.odBypass    = !OverdriveEnabled();
+        s.trim         = Trim();
+        s.inputSelect  = static_cast<int>(Input());
+        s.presetIndex  = PresetIndex();
+        s.gateEnabled  = GateEnabled();
+        s.cabEnabled   = CabEnabled();
+        s.odBypass     = !OverdriveEnabled();
         s.odDrive      = Drive();
         s.odBlend      = Blend();
         s.odOversample = OverdriveOversample();
         s.bassDb       = BassDb();
-        s.midDb       = MidDb();
-        s.trebleDb    = TrebleDb();
-        s.exclusive   = Exclusive();
+        s.midDb        = MidDb();
+        s.trebleDb     = TrebleDb();
+        s.exclusive    = Exclusive();
+        s.chainOrder   = GetChainOrder();
     }
 
     // ---- Telemetry (UI thread consumes and resets) ----------------------------------
@@ -456,6 +517,24 @@ public:
 
 private:
     static constexpr ma_uint32 kScratchFrames = 512;
+
+    static constexpr uint32_t PackOrder(const std::array<int, cfg::kNumDspSlots>& ord) noexcept {
+        uint32_t p = 0;
+        for (int i = 0; i < cfg::kNumDspSlots; ++i) {
+            p |= (static_cast<uint32_t>(ord[i] & 0x7) << (i * 4));
+        }
+        return p;
+    }
+
+    static constexpr std::array<int, cfg::kNumDspSlots> UnpackOrder(uint32_t p) noexcept {
+        return {
+            static_cast<int>((p >> 0)  & 0x7u),
+            static_cast<int>((p >> 4)  & 0x7u),
+            static_cast<int>((p >> 8)  & 0x7u),
+            static_cast<int>((p >> 12) & 0x7u),
+            static_cast<int>((p >> 16) & 0x7u)
+        };
+    }
 
     static void DataCallback(ma_device* device, void* output, const void* input,
                              ma_uint32 frameCount) {
@@ -580,14 +659,16 @@ private:
         return true;
     }
 
-    // DSP chain (owned) + non-owning handles for UI control / dry tap.
-    std::vector<std::unique_ptr<IDspNode>> dspChain_;
-    DcBlockerNode*                         dcBlocker_ = nullptr;
-    EnvelopeNoiseGateNode*                 gate_      = nullptr;
-    CompressorNode*                        comp_      = nullptr;
-    BassOverdriveNode*                     overdrive_ = nullptr;
-    ThreeBandEqNode*                       eq_        = nullptr;
-    CabSimNode*                            cab_       = nullptr;
+    // DSP chain (owned) + non-owning handles for UI control / dry tap / dynamic rack.
+    std::vector<std::unique_ptr<IDspNode>>     dspChain_;
+    DcBlockerNode*                             dcBlocker_ = nullptr;
+    EnvelopeNoiseGateNode*                     gate_      = nullptr;
+    CompressorNode*                            comp_      = nullptr;
+    BassOverdriveNode*                         overdrive_ = nullptr;
+    ThreeBandEqNode*                           eq_        = nullptr;
+    CabSimNode*                                cab_       = nullptr;
+    std::array<IDspNode*, cfg::kNumDspSlots>   rackNodes_{};
+    std::atomic<uint32_t>                      packedOrder_{PackOrder(kDefaultChainOrder)};
 
     History dryBuffer_;      // Pre-FX tap  -> tuner (48 kHz)
     History wetBuffer_;      // Post-FX tap -> triggered scope + high-band spectrum (48 kHz)

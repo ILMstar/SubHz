@@ -61,6 +61,7 @@ constexpr float  kCompDefaultThreshDb = -18.0f;
 constexpr float  kCompDefaultMakeupDb = 1.5f;
 constexpr float  kOverdriveCrossHz   = 150.0f;          // Split-band crossover (<150 Hz clean)
 constexpr int    kOdOversampleDefault = 4;              // 4x oversampling (192 kHz @ 48 kHz)
+constexpr int    kNumDspSlots        = 5;               // Reorderable rack: GATE, COMP, OD, EQ, CAB
 constexpr float  kDriveMin           = 1.0f;
 constexpr float  kDriveMax           = 25.0f;
 constexpr float  kDriveStep          = 0.5f;
@@ -110,6 +111,44 @@ constexpr float  kLimitLedHoldSec    = 0.25f;
 constexpr double kPi                 = 3.14159265358979323846;
 constexpr const char* kConfigFile    = "subhz.cfg";
 }  // namespace cfg
+
+// -------------------------------------------------------------------------------------
+//  Reorderable DSP rack slot identifiers & validation
+// -------------------------------------------------------------------------------------
+enum DspSlot : int {
+    kSlotGate = 0,
+    kSlotComp = 1,
+    kSlotOd   = 2,
+    kSlotEq   = 3,
+    kSlotCab  = 4
+};
+
+inline constexpr std::array<int, cfg::kNumDspSlots> kDefaultChainOrder = {
+    kSlotGate, kSlotComp, kSlotOd, kSlotEq, kSlotCab
+};
+
+inline const char* DspSlotName(int slot) noexcept {
+    static constexpr const char* kNames[cfg::kNumDspSlots] = { "GATE", "COMP", "OD", "EQ", "CAB" };
+    return (slot >= 0 && slot < cfg::kNumDspSlots) ? kNames[slot] : "?";
+}
+
+inline int DspSlotFromName(const char* s) noexcept {
+    if (!s) return -1;
+    for (int i = 0; i < cfg::kNumDspSlots; ++i) {
+        if (std::strcmp(s, DspSlotName(i)) == 0) return i;
+    }
+    if (s[0] >= '0' && s[0] < ('0' + cfg::kNumDspSlots) && s[1] == '\0') return s[0] - '0';
+    return -1;
+}
+
+inline bool IsValidChainOrder(const std::array<int, cfg::kNumDspSlots>& order) noexcept {
+    unsigned int mask = 0;
+    for (int idx : order) {
+        if (idx < 0 || idx >= cfg::kNumDspSlots) return false;
+        mask |= (1u << idx);
+    }
+    return mask == ((1u << cfg::kNumDspSlots) - 1u);
+}
 
 inline int ClampOversample(int factor) noexcept {
     return (factor >= 4) ? 4 : (factor >= 2) ? 2 : 1;
@@ -222,6 +261,7 @@ struct AppSettings {
     float tunerGateDb   = cfg::kTunerDefaultGateDb;
     bool  vsync         = true;
     bool  exclusive     = false;
+    std::array<int, cfg::kNumDspSlots> chainOrder = kDefaultChainOrder;
 };
 
 inline bool SaveSettings(const char* path, const AppSettings& s) noexcept {
@@ -243,6 +283,8 @@ inline bool SaveSettings(const char* path, const AppSettings& s) noexcept {
     std::fprintf(fp, "tunerGateDb=%.4f\n", s.tunerGateDb);
     std::fprintf(fp, "vsync=%d\n",         s.vsync       ? 1 : 0);
     std::fprintf(fp, "exclusive=%d\n",     s.exclusive   ? 1 : 0);
+    std::fprintf(fp, "chainOrder=%d,%d,%d,%d,%d\n",
+                 s.chainOrder[0], s.chainOrder[1], s.chainOrder[2], s.chainOrder[3], s.chainOrder[4]);
     std::fclose(fp);
     return true;
 }
@@ -253,6 +295,12 @@ inline bool LoadSettings(const char* path, AppSettings& s) noexcept {
     if (!fp) return false;
     char line[128]{};
     while (std::fgets(line, sizeof(line), fp)) {
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+        if (std::sscanf(line, "chainOrder=%d,%d,%d,%d,%d", &c0, &c1, &c2, &c3, &c4) == 5) {
+            const std::array<int, cfg::kNumDspSlots> cand = { c0, c1, c2, c3, c4 };
+            if (IsValidChainOrder(cand)) s.chainOrder = cand;
+            continue;
+        }
         char  key[64]{};
         float val = 0.0f;
         if (std::sscanf(line, "%63[^=]=%f", key, &val) == 2) {

@@ -248,17 +248,74 @@ static void DrawTelemetryPanel(const AudioEngine& engine, float inDb, float outD
              kX + 226, ledY + 1, 12, DARKGRAY);
 }
 
-static void DrawSignalFlowPanel(const AudioEngine& engine, int screenW) {
+static void DrawSignalFlowPanel(AudioEngine& engine, int screenW, int& dragSlot) {
     const int kX = std::max(864, screenW - 416);
     constexpr int kY = 46;
     DrawText(TextFormat("PRESET [P]: %s%s", engine.PresetName(),
                         engine.PresetModified() ? " *" : ""),
              kX, kY, 14, ui_col::kNeon);
-    DrawText("IN > HPF 10Hz > GATE > COMP > OD > EQ > CAB > LIM", kX, kY + 18, 12, LIGHTGRAY);
-    DrawText(TextFormat("OD [O]: %-3s  Drive [1/2]: %4.1fx  Blend [3/4]: %3d%%",
+
+    // Interactive Drag-and-Drop DSP Pedal Rack: HPF > [slot0] > [slot1] > [slot2] > [slot3] > [slot4] > LIM
+    const int rackY = kY + 17;
+    DrawText("HPF>", kX, rackY + 2, 12, GRAY);
+    int sx = kX + 34;
+    constexpr int kSlotW = 44;
+    constexpr int kSlotH = 16;
+    constexpr int kStepX = 52;
+    const Vector2 mouse  = GetMousePosition();
+    const auto    order  = engine.GetChainOrder();
+
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) dragSlot = -1;
+
+    int hoverSlot = -1;
+    for (int s = 0; s < cfg::kNumDspSlots; ++s) {
+        const int bx = sx + s * kStepX;
+        if (mouse.x >= bx && mouse.x <= bx + kSlotW &&
+            mouse.y >= rackY && mouse.y <= rackY + kSlotH) {
+            hoverSlot = s;
+        }
+    }
+    if (hoverSlot >= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        dragSlot = hoverSlot;
+    } else if (dragSlot >= 0 && hoverSlot >= 0 && hoverSlot != dragSlot &&
+               IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        engine.MoveChainSlot(dragSlot, hoverSlot);
+        dragSlot = hoverSlot;
+    }
+
+    const auto curOrder = engine.GetChainOrder();
+    for (int s = 0; s < cfg::kNumDspSlots; ++s) {
+        const int   bx       = sx + s * kStepX;
+        const int   nodeId   = curOrder[s];
+        const char* label    = DspSlotName(nodeId);
+        const bool  active   = engine.IsNodeActive(nodeId);
+        const bool  dragging = (dragSlot == s);
+        const bool  hovered  = (hoverSlot == s);
+
+        const Color bg = dragging ? Color{ 0x28, 0x48, 0x40, 0xFF }
+                       : hovered  ? Color{ 0x24, 0x24, 0x24, 0xFF }
+                                  : Color{ 0x16, 0x16, 0x16, 0xFF };
+        const Color border = dragging ? ui_col::kNeon
+                           : active   ? ui_col::kTuneGreen
+                                      : ui_col::kGrid;
+        const Color fg = active ? LIGHTGRAY : DARKGRAY;
+
+        DrawRectangle(bx, rackY, kSlotW, kSlotH, bg);
+        DrawRectangleLines(bx, rackY, kSlotW, kSlotH, border);
+        const int tw = MeasureText(label, 10);
+        DrawText(label, bx + (kSlotW - tw) / 2, rackY + 3, 10, fg);
+        if (s + 1 < cfg::kNumDspSlots) {
+            DrawText(">", bx + kSlotW + 2, rackY + 2, 12, DARKGRAY);
+        }
+    }
+    DrawText(">LIM", sx + cfg::kNumDspSlots * kStepX - 6, rackY + 2, 12, GRAY);
+    (void)order;
+
+    DrawText(TextFormat("OD [O]: %-3s  Drv [1/2]: %4.1fx  Blnd [3/4]: %3d%%  OS [X]: %dx",
                         engine.OverdriveEnabled() ? "ON" : "OFF",
                         engine.Drive(),
-                        static_cast<int>(std::round(engine.Blend() * 100.0f))),
+                        static_cast<int>(std::round(engine.Blend() * 100.0f)),
+                        engine.OverdriveOversample()),
              kX, kY + 36, 12, engine.OverdriveEnabled() ? ui_col::kTuneOrange : GRAY);
     DrawText(TextFormat("EQ (dB)  Bass [5/6]: %+5.1f  Mid [7/8]: %+5.1f  Treb [9/0]: %+5.1f",
                         engine.BassDb(), engine.MidDb(), engine.TrebleDb()),
@@ -412,6 +469,7 @@ int main() {
     char  bannerText[160]{};
     bool  bannerWarning = false;
     float bannerTimer   = 0.0f;
+    int   dragRackSlot  = -1;
 
     // Precompute dual-band logarithmic spectrum bar bin bounds:
     // - Bars below kLowBandCrossHz (900 Hz) use the 4x-decimated 12 kHz FFT (2.93 Hz bins,
@@ -488,6 +546,7 @@ int main() {
         if (IsKeyPressed(KEY_F2))      engine->CyclePlaybackDevice();
         if (IsKeyPressed(KEY_P))       engine->CyclePreset();
         if (IsKeyPressed(KEY_O))       engine->ToggleOverdrive();
+        if (IsKeyPressed(KEY_X))       engine->CycleOverdriveOversample();
         if (KeyStep(KEY_ONE))          engine->SetDrive(engine->Drive() - cfg::kDriveStep);
         if (KeyStep(KEY_TWO))          engine->SetDrive(engine->Drive() + cfg::kDriveStep);
         if (KeyStep(KEY_THREE))        engine->SetBlend(engine->Blend() - cfg::kBlendStep);
@@ -617,7 +676,7 @@ int main() {
 
         DrawStatusBar(*engine, screenW, vsyncOn);
         DrawTelemetryPanel(*engine, inMeterDb, outMeterDb, limitLedTime > 0.0f, adcClipTime > 0.0f);
-        DrawSignalFlowPanel(*engine, screenW);
+        DrawSignalFlowPanel(*engine, screenW, dragRackSlot);
         DrawTunerOverlay(tuner, smoothedCents, smoothedHz, tunerTracker.GateDb(), screenW);
 
         // Oscilloscope (WET, triggered)
